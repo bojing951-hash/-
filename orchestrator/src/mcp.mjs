@@ -138,6 +138,8 @@ const TOOLS = [
         max_attempts: { type: 'number' },
         executor: { type: 'string', description: '可选：claude-code' },
         cwd: { type: 'string', description: '执行目录（必须在项目目录内）' },
+        repo: { type: 'string', description: '项目内的 Git 仓库路径，供固定版本工作树使用' },
+        base_commit: { type: 'string', description: '工作树使用的固定 Git 提交' },
         mode: { type: 'string', enum: ['plan', 'acceptEdits'], description: '写模式必须由管理员审批' },
         verify_profile_id: { type: 'string', description: '已登记的可信校验配置 ID' },
         commit: { type: 'boolean', description: '是否提交（需要审批 + 校验通过 + commit_paths）' },
@@ -268,6 +270,8 @@ async function callTool(name, args) {
         executorConfig: args.executor
           ? {
               cwd: args.cwd,
+              repo: args.repo,
+              base_commit: args.base_commit,
               mode: args.mode,
               verify_profile_id: args.verify_profile_id,
               commit: args.commit,
