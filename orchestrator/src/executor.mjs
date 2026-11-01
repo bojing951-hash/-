@@ -185,7 +185,7 @@ export async function createWorktree({ repo, commit, dest }) {
 export async function worktreeStatus(dir) {
   return new Promise((resolve) => {
     execFile('git', ['-C', dir, 'status', '--porcelain'], { timeout: 30_000 }, (e, so) =>
-      resolve({ clean: (so || '').trim() === '', raw: (so || '').trim() })
+      resolve({ clean: !e && (so || '').trim() === '', raw: (so || '').trim() })
     );
   });
 }
