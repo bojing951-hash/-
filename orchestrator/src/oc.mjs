@@ -35,6 +35,8 @@ function run(args, timeoutMs = 300_000) {
       (err, stdout, stderr) => {
         resolve({
           code: err?.code ?? 0,
+          failed: Boolean(err),
+          signal: err?.signal ?? null,
           killed: Boolean(err?.killed),
           stdout: stdout ?? '',
           stderr: stderr ?? ''
@@ -165,6 +167,9 @@ export async function ask({ agentId, sessionKey, message, model, timeoutMs }) {
   const args = ['agent', '--agent', agentId, '--session-id', sessionKey, '--message', message, '--json'];
   if (model) args.push('--model', model);
   const r = await run(args, timeoutMs ?? 300_000);
+  if (r.failed) {
+    return { ok: false, text: '', error: (r.stderr || `进程执行失败: ${r.signal || r.code}`).slice(0, 500) };
+  }
   const data = parseJsonLoose(r.stdout);
   if (!data) {
     return { ok: false, text: '', error: (r.stderr || r.stdout || '无输出').slice(0, 500) };
