@@ -162,13 +162,22 @@ export async function createWorktree({ repo, commit, dest }) {
       );
     });
 
-  const exists = await git(['cat-file', '-e', `${commit}^{commit}`]);
-  if (exists.code !== 0) return { ok: false, error: `commit 不存在: ${commit}` };
+  if (typeof commit !== 'string' || !/^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/.test(commit)) {
+    return { ok: false, error: '需要完整的 Commit 对象 ID' };
+  }
+  const exists = await git(['cat-file', '-t', commit]);
+  if (exists.code !== 0 || exists.out.trim() !== 'commit') {
+    return { ok: false, error: `commit 不存在或对象类型错误: ${commit}` };
+  }
 
   const add = await git(['worktree', 'add', '--detach', dest, commit]);
   if (add.code !== 0) return { ok: false, error: add.out.slice(0, 400) };
 
   const head = await git(['rev-parse', 'HEAD'], dest);
+  if (head.code !== 0 || head.out.trim() !== commit.toLowerCase()) {
+    const cleanup = await removeWorktree({ repo, dest });
+    return { ok: false, error: `工作树 HEAD 校验失败${cleanup.ok ? '' : ': 清理失败 ' + cleanup.out.slice(0, 400)}` };
+  }
   return { ok: true, path: dest, sha: head.out.trim() };
 }
 
