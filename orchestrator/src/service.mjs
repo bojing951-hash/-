@@ -1947,7 +1947,7 @@ async function notify(text) {
   const target = process.env.JARVIS_NOTIFY_TARGET || getSetting('notify_target');
   if (!target) return { sent: false, reason: 'notify_target 未配置' };
   const { execFile } = await import('node:child_process');
-  const bin = join(HOME, '.openclaw/bin/openclaw');
+  const bin = oc.openclawBin();
   return new Promise((resolve) => {
     execFile(
       bin,
