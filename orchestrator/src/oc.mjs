@@ -130,8 +130,8 @@ export async function createAgent({ name, model, workspace }) {
     '--json'
   ]);
   const data = parseJsonLoose(r.stdout);
-  if (!data?.agentId) {
-    throw new Error(`创建 agent 失败: ${(r.stderr || r.stdout || '').slice(0, 400)}`);
+  if (r.failed || !data?.agentId) {
+    throw new Error(`创建 agent 失败: ${(r.stderr || r.stdout || `进程执行失败: ${r.signal || r.code}`).slice(0, 400)}`);
   }
   return data;
 }
@@ -139,8 +139,13 @@ export async function createAgent({ name, model, workspace }) {
 
 /** 复用时同步 agent 的模型与工作区（OpenClaw 把它们存在 agents.entries.<id>）。 */
 export async function configureAgent(agentId, { model, workspace }) {
-  if (model) await run(['config', 'set', `agents.entries.${agentId}.model`, model], 60_000);
-  if (workspace) await run(['config', 'set', `agents.entries.${agentId}.workspace`, workspace], 60_000);
+  for (const [key, value] of [['model', model], ['workspace', workspace]]) {
+    if (!value) continue;
+    const r = await run(['config', 'set', `agents.entries.${agentId}.${key}`, value], 60_000);
+    if (r.failed) {
+      throw new Error(`配置 agent ${key} 失败: ${(r.stderr || r.stdout || `进程执行失败: ${r.signal || r.code}`).slice(0, 400)}`);
+    }
+  }
 }
 
 export async function deleteAgent(name) {
