@@ -231,7 +231,7 @@ export async function talk({ agent: agentRef, message, conversation: convRef, se
     .prepare('INSERT INTO executions (id,task_id,agent_id,status,model,session_key,started_at) VALUES (?,?,?,?,?,?,?)')
     .run(execId, null, a.id, 'running', a.model, key, started);
 
-  const res = await oc.ask({ agentId: a.openclaw_agent_id, sessionKey: key, message });
+  const res = await oc.ask({ agentId: a.openclaw_agent_id, sessionKey: key, message, model: a.model });
   finishExecution(execId, res);
   return { ...res, sessionKey: key, agent: a.name, model: res.model || a.model };
 }
@@ -373,7 +373,7 @@ export async function runTask(ref, deps = {}) {
     .prepare('INSERT INTO executions (id,task_id,agent_id,status,model,session_key,started_at) VALUES (?,?,?,?,?,?,?)')
     .run(execId, task.id, agent.id, 'running', agent.model, sessionKey, started);
 
-  const res = await oc.ask({ agentId: agent.openclaw_agent_id, sessionKey, message: task.input });
+  const res = await oc.ask({ agentId: agent.openclaw_agent_id, sessionKey, message: task.input, model: agent.model });
   finishExecution(execId, res);
 
   if (res.ok) {
