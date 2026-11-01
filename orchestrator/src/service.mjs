@@ -1231,7 +1231,7 @@ async function runWorkflowInner(ref) {
       db().prepare('UPDATE workflows SET status=?, cursor=?, rounds=rounds+1, updated_at=? WHERE id=?')
         .run('failed', stageIdx, now(), w.id);
       const failedWf = getWorkflow(w.id);
-      await notify(`JARVIS 工作流「${failedWf.name}」在阶段「${stage.name}」失败：${failed.error || '未知原因'}`);
+      await notify(`JARVIS 工作流「${failedWf.name}」（项目 ${project.slug}）在阶段「${stage.name}」失败：${failed.error || '未知原因'}`, project.id, failedWf.id);
       return { ok: false, blocked: 'stage_failed', stage: stage.name, failed, workflow: failedWf, results };
     }
 
@@ -1241,7 +1241,7 @@ async function runWorkflowInner(ref) {
   db().prepare('UPDATE workflows SET status=?, rounds=rounds+1, updated_at=? WHERE id=?').run('done', now(), w.id);
   const finished = getWorkflow(w.id);
   const lines = results.map((r) => `- ${r.node}: ${r.ok ? '完成' : '失败'}`);
-  const note = await notify(`JARVIS 工作流「${finished.name}」已完成（项目 ${project.slug}）\n${lines.join('\n')}`);
+  const note = await notify(`JARVIS 工作流「${finished.name}」已完成（项目 ${project.slug}）\n${lines.join('\n')}`, project.id, finished.id);
   return { ok: true, workflow: finished, results, notified: note };
 }
 
@@ -1943,7 +1943,7 @@ export function getSetting(key) {
  * 通过 OpenClaw 已有的飞书通道发通知。
  * 失败不抛异常：通知失败不应该让工作流回滚。
  */
-async function notify(text) {
+async function notify(text, projectId, workflowId) {
   const target = process.env.JARVIS_NOTIFY_TARGET || getSetting('notify_target');
   if (!target) return { sent: false, reason: 'notify_target 未配置' };
   const { execFile } = await import('node:child_process');
@@ -1955,7 +1955,7 @@ async function notify(text) {
       { timeout: 60_000, env: { ...process.env, PATH: `${join(HOME, '.openclaw/bin')}:${process.env.PATH}` } },
       (err, stdout, stderr) => {
         const ok = !err;
-        event('notify.sent', null, { ok, error: ok ? '' : String(stderr || err).slice(0, 200) });
+        event('notify.sent', projectId, { ok, error: ok ? '' : String(stderr || err).slice(0, 200), workflow_id: workflowId });
         resolve({ sent: ok, error: ok ? '' : String(stderr || err).slice(0, 300) });
       }
     );
