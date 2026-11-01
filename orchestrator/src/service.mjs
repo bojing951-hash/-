@@ -219,7 +219,13 @@ export async function talk({ agent: agentRef, message, conversation: convRef, se
   }
 
   let key = sessionKey;
-  if (convRef) key = getConversation(convRef).session_key;
+  if (convRef) {
+    const conv = getConversation(convRef);
+    if (conv.agent_id !== a.id) {
+      return { ok: false, blocked: 'conversation_agent_mismatch', error: '会话不属于所选 Agent' };
+    }
+    key = conv.session_key;
+  }
   if (!key) {
     const conv = createConversation({ agent: a.id });
     key = conv.session_key;
@@ -359,6 +365,9 @@ export async function runTask(ref, deps = {}) {
   }
 
   const agent = getAgent(task.assignee_agent_id);
+  if (agent.status !== 'active') {
+    return { ok: false, blocked: 'agent_inactive', error: `Agent ${agent.name} 状态为 ${agent.status}` };
+  }
   const claim = db()
     .prepare("UPDATE tasks SET status='running', attempts=attempts+1, updated_at=? WHERE id=? AND status IN ('pending','approved','retry_pending')")
     .run(now(), task.id);
