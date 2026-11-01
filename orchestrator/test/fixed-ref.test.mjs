@@ -1,13 +1,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync, readFileSync, existsSync, appendFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, appendFileSync, mkdtempSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { tmpdir } from 'node:os';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
-const source = resolve(process.env.FIXED_REF_SOURCE || '.');
-const evidence = resolve(process.env.FIXED_REF_EVIDENCE);
-mkdirSync(evidence); // Evidence must be fresh; never overwrite an earlier run.
+const source = process.env.FIXED_REF_SOURCE
+  ? resolve(process.env.FIXED_REF_SOURCE)
+  : fileURLToPath(new URL('../../', import.meta.url));
+const evidence = process.env.FIXED_REF_EVIDENCE
+  ? resolve(process.env.FIXED_REF_EVIDENCE)
+  : mkdtempSync(join(tmpdir(), 'fixed-ref-'));
+// Explicit evidence paths must be fresh; never overwrite an earlier run.
+if (process.env.FIXED_REF_EVIDENCE) mkdirSync(evidence);
 const { createWorktree } = await import(pathToFileURL(join(source, 'orchestrator/src/executor.mjs')));
 const originalPath = process.env.PATH;
 const bin = join(evidence, 'bin');
