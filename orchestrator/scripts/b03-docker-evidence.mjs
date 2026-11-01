@@ -29,8 +29,29 @@ export function parseDockerEventLine(line) {
   } catch (e) {
     throw new Error(`invalid Docker event JSON: ${e.message}`);
   }
-  const timeMatch = raw.match(/"timeNano"\s*:\s*"?(\d+)"?/);
-  const timeNano = timeMatch ? timeMatch[1] : (typeof obj.timeNano === 'string' ? obj.timeNano : null);
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+    throw new Error('Docker event must be a JSON object');
+  }
+  // JSON.parse validates syntax; scan complete tokens to locate only the root
+  // timeNano value without rounding a JSON number through Number. Escaped keys,
+  // nested objects and strings containing key-like text remain unambiguous.
+  const tokens = raw.match(/"(?:[^"\\]|\\.)*"|[{}\[\]:,]|[^\s{}\[\]:,]+/g);
+  let depth = 0;
+  const timeTokens = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (depth === 1 && token.startsWith('"') && tokens[i + 1] === ':' && JSON.parse(token) === 'timeNano') {
+      timeTokens.push(tokens[i + 2]);
+    }
+    if (token === '{' || token === '[') depth++;
+    if (token === '}' || token === ']') depth--;
+  }
+  if (timeTokens.length !== 1) throw new Error('missing or duplicate root timeNano');
+  const token = timeTokens[0];
+  const timeNano = token.startsWith('"') ? JSON.parse(token) : token;
+  if (typeof timeNano !== 'string' || !/^\d+$/.test(timeNano) || BigInt(timeNano) <= 0n) {
+    throw new Error('timeNano must be a positive decimal integer');
+  }
   const type = obj.Type ?? obj.type ?? null;
   const action = obj.Action ?? obj.status ?? null;
   const actorId = obj.Actor?.ID ?? obj.Actor?.Id ?? null;
@@ -44,7 +65,7 @@ function eventTime(ev) {
   return n > 0n ? n : null;
 }
 
-const ms = (timeNano) => timeNano / 1_000_000n;
+const nanoseconds = (hostMs) => BigInt(hostMs) * 1_000_000n;
 
 export function evaluateDockerRaceEvidence(e) {
   const failures = [];
@@ -79,6 +100,12 @@ export function evaluateDockerRaceEvidence(e) {
     }
     require(rawError === null, `raw Docker events parse error: ${rawError}`);
     require(parsedRaw.length === events.length, `raw Docker events count ${parsedRaw.length} != parsed ${events.length}`);
+    const fields = ['type', 'action', 'actorId', 'actorName', 'timeNano'];
+    for (let i = 0; i < Math.min(parsedRaw.length, events.length); i++) {
+      for (const field of fields) {
+        require(parsedRaw[i][field] === events[i]?.[field], `raw Docker event ${i} ${field} differs from parsed event`);
+      }
+    }
   }
   const target = events.filter(
     (ev) => ev.type === 'container' && ev.actorId === e.containerId && ev.actorName === e.containerName
@@ -128,9 +155,9 @@ export function evaluateDockerRaceEvidence(e) {
 
   const timelineFields = ['startedAt', 'barrierAt', 'cancelRequestedAt', 'releaseAt', 'cancelResolvedAt', 'finalStateAt'];
   for (const field of timelineFields) {
-    require(Number.isFinite(e?.[field]), `missing timeline field ${field}`);
+    require(Number.isSafeInteger(e?.[field]) && e[field] >= 0, `missing or invalid timeline field ${field}`);
   }
-  if (timelineFields.every((field) => Number.isFinite(e?.[field]))) {
+  if (timelineFields.every((field) => Number.isSafeInteger(e?.[field]) && e[field] >= 0)) {
     require(e.barrierAt >= e.startedAt, 'barrier before test start');
     require(e.cancelRequestedAt >= e.barrierAt, 'cancel requested before barrier');
     require(e.releaseAt >= e.cancelRequestedAt, 'release before cancel request');
@@ -138,18 +165,15 @@ export function evaluateDockerRaceEvidence(e) {
     require(e.finalStateAt >= e.cancelResolvedAt, 'final state query before cancel resolution');
 
     if (REQUIRED.every((a) => times[a] !== null)) {
-      const createMs = ms(times.create);
-      const startMs = ms(times.start);
-      const dieMs = ms(times.die);
-      const destroyMs = ms(times.destroy);
-
-      require(createMs >= BigInt(e.releaseAt), 'create event before barrier release');
-      require(startMs >= BigInt(e.releaseAt), 'start event before barrier release');
-      require(createMs >= BigInt(e.startedAt), 'create event before test start');
-      require(dieMs <= BigInt(e.cancelResolvedAt), 'die event after cancel confirmation');
-      require(destroyMs <= BigInt(e.finalStateAt), 'destroy event after final state query');
-      require(createMs <= BigInt(e.finalStateAt), 'create event after final state query');
-      require(startMs <= BigInt(e.finalStateAt), 'start event after final state query');
+      // Compare at nanosecond precision against the recorded host-ms boundary.
+      // Truncating an event to ms cannot prove it preceded confirmation.
+      require(times.create >= nanoseconds(e.releaseAt), 'create event before barrier release');
+      require(times.start >= nanoseconds(e.releaseAt), 'start event before barrier release');
+      require(times.create >= nanoseconds(e.startedAt), 'create event before test start');
+      require(times.die <= nanoseconds(e.cancelResolvedAt), 'die event after cancel confirmation');
+      require(times.destroy <= nanoseconds(e.finalStateAt), 'destroy event after final state query');
+      require(times.create <= nanoseconds(e.finalStateAt), 'create event after final state query');
+      require(times.start <= nanoseconds(e.finalStateAt), 'start event after final state query');
     }
   }
 
