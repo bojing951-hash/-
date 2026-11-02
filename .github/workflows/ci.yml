@@ -36,5 +36,44 @@ jobs:
           node --version
           npm --version
           uname -a
+      - name: prepare real Docker executor
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUNNER_OS" = Linux
+          test "$GITHUB_ACTIONS" = true
+          docker_bin="$(readlink -f "$(command -v docker)")"
+          test -x "$docker_bin"
+          "$docker_bin" version
+          timeout 600 "$docker_bin" build -f orchestrator/docker/executor.Dockerfile -t jarvis-executor:2.1.104 .
+          "$docker_bin" image inspect jarvis-executor:2.1.104 --format '{{.Id}}'
+          "$docker_bin" network create --internal jarvis-internal
+          test "$("$docker_bin" network inspect jarvis-internal --format '{{.Internal}}')" = true
+          "$docker_bin" network inspect jarvis-internal --format 'network={{.Name}} internal={{.Internal}}'
+          compat=/Applications/Docker.app/Contents/Resources/bin/docker
+          test ! -e "$compat"
+          test ! -L "$compat"
+          sudo mkdir -p "$(dirname "$compat")"
+          sudo ln -s "$docker_bin" "$compat"
+          test "$(readlink -f "$compat")" = "$docker_bin"
+          printf 'Docker compatibility path: %s -> %s\n' "$compat" "$docker_bin"
+          "$compat" image inspect jarvis-executor:2.1.104 --format '{{.Id}}'
+          node --input-type=module -e 'import { isolationStatus } from "./orchestrator/src/isolation.mjs"; const status = await isolationStatus(); console.log(JSON.stringify(status)); if (!status.available || !status.networkInternal) process.exit(1);'
+      - name: verify real writable and readonly mounts
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_id="$(docker image inspect jarvis-executor:2.1.104 --format '{{.Id}}')"
+          probe_dir="$(mktemp -d)"
+          trap 'status=$?; rm -rf -- "$probe_dir" || exit 1; exit "$status"' EXIT
+          chmod 0777 "$probe_dir"
+          constraints=(--rm --network none --user 1000:1000 --security-opt no-new-privileges --cap-drop ALL --pids-limit 256 --memory 2g -w /work --entrypoint node)
+          docker run "${constraints[@]}" -v "$probe_dir:/work:rw" "$image_id" -e 'const fs = require("node:fs"); if (process.getuid() !== 1000 || process.getgid() !== 1000) throw Error("unexpected uid/gid"); fs.writeFileSync("/work/rw-probe", "RW_OK"); console.log("RW_OK uid=1000 gid=1000");'
+          test "$(cat "$probe_dir/rw-probe")" = RW_OK
+          docker run "${constraints[@]}" -v "$probe_dir:/work:ro" "$image_id" -e 'const fs = require("node:fs"); if (process.getuid() !== 1000 || process.getgid() !== 1000) throw Error("unexpected uid/gid"); console.log("RO_NODE_STARTED uid=1000 gid=1000"); let code; try { fs.writeFileSync("/work/ro-probe", "unexpected"); } catch (error) { code = error.code; } if (code !== "EROFS") throw Error("expected EROFS, received " + code); console.log("RO_EROFS");'
+          test ! -e "$probe_dir/ro-probe"
+          test ! -L "$probe_dir/ro-probe"
+          test "$(cat "$probe_dir/rw-probe")" = RW_OK
+          printf 'HOST_MOUNT_CONTROLS_OK image=%s uid=1000 gid=1000\n' "$image_id"
       - name: unit + fault-injection tests
         run: node --test orchestrator/test/*.test.mjs
