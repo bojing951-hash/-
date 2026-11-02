@@ -65,13 +65,13 @@ grep "received message from" ~/Library/Logs/openclaw/gateway.log | tail -3
 
 拿到后改回 `allowlist` 并写入 `allowFrom`。
 
-> 本版本 `openclaw pairing list` 会报 `No chat DM pairing channels are configured`，无法用 CLI 审批配对。直接改用 allowlist 更确定，也更严格。
+> 原个人部署机器运行未指定通道的 `openclaw pairing list` 曾报 `No chat DM pairing channels are configured`，当时改用 allowlist。固定公开版本提供显式通道的 `pairing list feishu` / `pairing approve feishu <CODE>` 入口；该历史报错不代表整个版本不支持 CLI 配对，当前账号及手机配对流程仍待验证。
 
 ## 访问控制语义
 
 | dmPolicy | 行为 |
 |---|---|
-| `pairing` | 陌生人收到配对码，需 CLI 审批（本版本 CLI 不可用） |
+| `pairing` | 陌生人收到配对码，需 CLI 审批（原机器配对流程未验证） |
 | `allowlist` | **只有 allowFrom 里的人能私聊**（推荐） |
 | `open` | 任何人可私聊，需 `allowFrom` 含 `"*"` |
 | `disabled` | 关闭私聊 |
