@@ -8,11 +8,11 @@
  * - 不使用 bypassPermissions
  * - 记录真实 exit code / git 版本，不伪造证据
  */
-import { execFile, spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { execFile, execFileSync, spawn } from 'node:child_process';
+import { existsSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { safeChildEnv } from './security.mjs';
-import { join } from 'node:path';
+import { join, relative, isAbsolute } from 'node:path';
 
 const HOME = homedir();
 
@@ -154,7 +154,10 @@ export async function removeFrozenWorktree({ repo, dest }) {
 /* ------------------------------ 隔离工作树（DEF-07） ----------------------- */
 
 /** 从固定 commit 创建一次性工作树；不触碰用户工作目录。 */
-export async function createWorktree({ repo, commit, dest }) {
+export async function createWorktree({ repo, commit, dest, audit = false }) {
+  if (audit) {
+    try { auditGit(repo,['worktree','add','--detach',dest,commit]); const sha=auditGit(dest,['rev-parse','HEAD']); if(sha!==commit.toLowerCase()) throw new Error('工作树 HEAD 校验失败'); return {ok:true,path:dest,sha}; } catch(e) { return {ok:false,error:e.message}; }
+  }
   const git = (args, cwd = repo) =>
     new Promise((resolve) => {
       execFile('git', ['-C', cwd, ...args], { timeout: 120_000, env: safeChildEnv() }, (e, so, se) =>
@@ -182,7 +185,8 @@ export async function createWorktree({ repo, commit, dest }) {
 }
 
 /** 工作树状态：初始必须干净（AC-15）。 */
-export async function worktreeStatus(dir) {
+export async function worktreeStatus(dir, { audit = false } = {}) {
+  if (audit) { try { const raw=auditGit(dir,['status','--porcelain']); return {clean:!raw,raw}; } catch(e) { return {clean:false,raw:e.message}; } }
   return new Promise((resolve) => {
     execFile('git', ['-C', dir, 'status', '--porcelain'], { timeout: 30_000 }, (e, so) =>
       resolve({ clean: !e && (so || '').trim() === '', raw: (so || '').trim() })
@@ -223,7 +227,8 @@ export async function revParseRef({ repo, ref }) {
   });
 }
 
-export async function removeWorktree({ repo, dest }) {
+export async function removeWorktree({ repo, dest, audit = false }) {
+  if(audit) { try { return {ok:true,out:auditGit(repo,['worktree','remove','--force',dest])}; } catch(e) {return {ok:false,out:e.message};} }
   return new Promise((resolve) => {
     execFile('git', ['-C', repo, 'worktree', 'remove', '--force', dest], { timeout: 60_000 }, (e, so, se) =>
       resolve({ ok: !e, out: (so || '') + (se || '') })
@@ -235,4 +240,50 @@ export async function removeWorktree({ repo, dest }) {
 export async function executorStatus() {
   const r = await run(claudeBin(), ['--version'], { cwd: HOME, timeoutMs: 30_000 });
   return { bin: claudeBin(), version: (r.stdout || r.stderr).trim(), ok: r.code === 0 };
+}
+
+
+// Audit host Git operations have a separate, bounded policy. Ordinary executors
+// retain their existing environment and behavior.
+const auditFlags = ['--no-replace-objects', '--no-lazy-fetch', '--literal-pathspecs', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false'];
+export function auditGit(repo, args, binary = false) {
+  const data = execFileSync('/usr/bin/git', [...auditFlags, '-C', repo, ...args], {
+    timeout: 15000, maxBuffer: 1024 * 1024,
+    env: { PATH: '/usr/bin:/bin', HOME: '/nonexistent', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1', GIT_NO_REPLACE_OBJECTS: '1' },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  return binary ? data : new TextDecoder('utf-8', { fatal: true, ignoreBOM:true }).decode(data).trim();
+}
+function auditWithin(path, root) {
+  const rel = relative(root, path);
+  if (rel === '..' || rel.startsWith('../') || isAbsolute(rel)) throw new Error('审计路径不在项目范围内');
+}
+export function auditRepository(repo, projectDir, commit) {
+  if (typeof commit !== 'string' || !/^(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})$/.test(commit)) throw new Error('需要完整 Commit ID');
+  const project = realpathSync(projectDir), cwd = realpathSync(isAbsolute(repo) ? repo : join(project, repo));
+  auditWithin(cwd, project);
+  const gitdir = realpathSync(auditGit(cwd, ['rev-parse', '--absolute-git-dir']));
+  const common = realpathSync(auditGit(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
+  auditWithin(gitdir, project); auditWithin(common, project);
+  // A configured process/smudge/clean command can execute on the host at checkout.
+  let filters;
+  try { filters = auditGit(cwd, ['config', '--get-regexp', '^filter\\..*\\.(process|smudge|clean)$']); }
+  catch (e) { if (e.status !== 1) throw e; filters = ''; }
+  if (filters) throw new Error('审计仓库存在外部 filter 配置');
+  if (auditGit(cwd, ['cat-file', '-t', commit]) !== 'commit') throw new Error('对象不是 commit');
+  const identity = path => { const st=statSync(path); if (!st.isDirectory()) throw new Error('需要目录'); return { path, dev:st.dev, ino:st.ino }; };
+  return { project:identity(project), repo:identity(cwd), gitdir:identity(gitdir), common:identity(common), commit:commit.toLowerCase() };
+}
+export function auditContract(repo, commit, path) {
+  if (typeof path !== 'string' || Buffer.byteLength(path)>4096 || path.includes('\\') || /[\x00-\x20\x7f]/.test(path) || path.split('/').some(x=>!x || x==='.' || x==='..') || isAbsolute(path)) throw new Error('非法契约路径');
+  if (!/^(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})$/.test(commit) || auditGit(repo,['cat-file','-t',commit])!=='commit') throw new Error('契约来源必须是完整 commit');
+  const entry = auditGit(repo,['ls-tree','-z',commit,'--',path],true).toString('utf8');
+  const match=/^(100644|100755) blob ([a-f0-9]+)\t([^\0]+)\0$/.exec(entry);
+  if (!match || match[3]!==path) throw new Error('契约必须是普通 blob');
+  const size=Number(auditGit(repo,['cat-file','-s',match[2]]));
+  if (size>262144) throw new Error('契约超限');
+  const bytes=auditGit(repo,['cat-file','blob',match[2]],true);
+  const text=new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(bytes);
+  if (!text.trim()) throw new Error('契约不能为空');
+  return { text, source:{ commit:commit.toLowerCase(), path, blob:match[2] } };
 }

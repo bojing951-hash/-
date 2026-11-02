@@ -74,7 +74,8 @@ test('MCP executor fixed inputs persist through production routes without relaxi
   });
   await t.test('schema declares two strings without expanding approval or audit tools',()=>{
    assert.equal(definition.inputSchema.properties.repo.type,'string');assert.equal(definition.inputSchema.properties.base_commit.type,'string');assert.equal(definition.inputSchema.properties.kind,undefined);
-   assert(!tools.tools.some(x=>/shell|task_approve|approval_sign|audit_create/i.test(x.name)));
+   assert(tools.tools.some(x=>x.name==='audit_create'));
+   assert(!tools.tools.some(x=>/shell|task_approve|approval_sign|audit/i.test(x.name) && x.name!=='audit_create'));
   });
   await t.test('unapproved write is rejected by actual authorize gate with fixed plan',async()=>{
    assert.match(rejected(await tool('task_run',{task:task.id})).error,/需要本地管理员审批/);

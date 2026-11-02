@@ -80,9 +80,9 @@ test('审计任务缺少契约应被拒绝', async () => {
     project: p.id,
     title: '审计',
     input: 'x',
-    kind: 'audit',
-    executorConfig: { repo: '/tmp', commit: 'abc' }
+    executorConfig: {}
   });
+  svc.updateTask(t.id, { kind:'audit', executor_config:JSON.stringify({repo:'/tmp',commit:'abc'}) });
   const r = await svc.runTask(t.id);
   assert.equal(r.ok, false);
   assert.equal(r.blocked, 'no_contract');

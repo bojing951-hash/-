@@ -13,6 +13,7 @@ import * as oc from './oc.mjs';
 const SERVER_INFO = { name: 'jarvis-control', version: '1.0.0' };
 
 const TOOLS = [
+  { name: 'audit_create', description: '创建固定版本只读审计任务', inputSchema: { type:'object', additionalProperties:false, properties:Object.fromEntries(['project','title','repo','commit','contract_commit','contract_path'].map(k=>[k,{type:'string',minLength:1}])), required:['project','title','repo','commit','contract_commit','contract_path'] } },
   {
     name: 'project_create',
     description: '创建一个项目。项目之间会话、资料、权限隔离。',
@@ -257,6 +258,8 @@ async function callTool(name, args) {
         ? ok(JSON.stringify({ from: args.from, to: args.to, task: r.task.id, status: r.task.status, result: r.text }, null, 2))
         : err(JSON.stringify({ error: r.error, task: r.task?.id, status: r.task?.status }, null, 2));
     }
+    case 'audit_create':
+      return ok(JSON.stringify(svc.createAuditTask(args)));
     case 'task_create':
       return ok(JSON.stringify(svc.createTask({
         project: args.project,

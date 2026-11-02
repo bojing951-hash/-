@@ -258,12 +258,35 @@ function finishExecution(execId, res) {
 
 /* ----------------------------------- Tasks ----------------------------------- */
 
+export function createAuditTask(args) {
+  const fields=['project','title','repo','commit','contract_commit','contract_path'];
+  if (!args || Object.keys(args).length!==6 || Object.keys(args).some(k=>!fields.includes(k)) || fields.some(k=>typeof args[k]!=='string' || !args[k].trim() || Buffer.byteLength(args[k])>4096) || args.title.length>256) throw new Error('audit_create 仅接受六个必填字符串');
+  const project=getProject(args.project);
+  const repository=ex.auditRepository(args.repo,project.dir,args.commit);
+  const contract=ex.auditContract(repository.repo.path,args.contract_commit,args.contract_path);
+  return createTask({project:project.id,title:args.title,kind:'audit',executorConfig:{repo:repository.repo.path,commit:args.commit,contract:contract.text,contract_source:contract.source}});
+}
+function auditScope(id, project, cfg) {
+  if (typeof cfg.contract!=='string' || !cfg.contract.trim() || Buffer.byteLength(cfg.contract)>262144) throw new Error('审计必须提供 contract');
+  const repository=ex.auditRepository(cfg.repo,project.dir,cfg.commit);
+  if(cfg.contract_source) {
+    const c=ex.auditContract(repository.repo.path,cfg.contract_source.commit,cfg.contract_source.path);
+    if(c.text!==cfg.contract || canonicalJson(c.source)!==canonicalJson(cfg.contract_source)) throw new Error('固定契约来源漂移');
+  }
+  return {task_id:id,project_id:project.id,repository,contract_sha256:sha256(cfg.contract),contract_source:cfg.contract_source??null,runner:'claude-code',mode:'plan',readOnly:true};
+}
+
 export function createTask({ project: projectRef, title, input, assignee, kind, needsApproval, maxAttempts, parentTaskId, workflowId, executor, executorConfig }) {
   const project = getProject(projectRef);
   // 在项目范围内解析，避免跨项目同名 Agent 歧义
   const a = assignee ? getAgent(assignee, project.id) : null;
   if (a && a.project_id !== project.id) throw new Error('Agent 不属于该项目，禁止跨项目直接指派');
   const id = newId('tsk');
+  if(kind==='audit') {
+    if(Object.hasOwn(executorConfig??{},'scope')) throw new Error('不接受调用方审计快照');
+    executorConfig={...executorConfig,scope:auditScope(id,project,executorConfig??{})};
+    executor='claude-code';
+  }
   const t = now();
   db()
     .prepare(`INSERT INTO tasks (id,project_id,workflow_id,parent_task_id,title,kind,status,assignee_agent_id,input,max_attempts,needs_approval,executor,executor_config,verify_profile_id,commit_paths,created_at,updated_at)
@@ -1408,7 +1431,7 @@ async function runAuditTask(task, project, deps = {}) {
     return { ok: false, blocked: 'bad_audit_config', error: '审计任务必须提供 repo 与 commit' };
   }
   if (!contract) {
-    return { ok: false, blocked: 'no_contract', error: '审计任务必须提供冻结的验收契约（contract）' };
+    return { ok: false, blocked: 'no_contract', error: '审计任务必须提供固定审计依据（contract）' };
   }
 
   const rc = resolveProjectPath(repo, project.dir);
@@ -1417,44 +1440,61 @@ async function runAuditTask(task, project, deps = {}) {
     return { ok: false, blocked: 'repo_outside_project', error: rc.error };
   }
 
+  const validate = (running = false) => {
+    const fresh=getTask(task.id), p=getProject(fresh.project_id), c=JSON.parse(fresh.executor_config||'{}');
+    if(p.status!=='active' || ! (running ? ['running'] : ['pending','authorized','retry_pending']).includes(fresh.status)) throw new Error('审计暂停、取消或状态不允许');
+    if(fresh.project_id!==project.id || fresh.kind!=='audit' || !c.scope || canonicalJson(c)!==canonicalJson(cfg) || canonicalJson(auditScope(fresh.id,p,c))!==canonicalJson(c.scope)) throw new Error('审计范围快照缺失或漂移');
+  };
+  try { validate(); } catch(e) { return {ok:false,blocked:'audit_scope',error:e.message}; }
   const st = await isolation.isolationStatus();
+  try { validate(); } catch(e) { return {ok:false,blocked:'audit_scope',error:e.message}; }
   if (!st.available) {
     recordAttempt({ task, project, phase: 'isolation', status: 'rejected', blocked: 'isolation_unavailable', reason: st.reason });
     return { ok: false, blocked: 'isolation_unavailable', error: st.reason };
   }
 
+  const execId = newId('exe');
+  db().exec('BEGIN IMMEDIATE');
+  try {
+  validate();
   const claim = db()
     .prepare("UPDATE tasks SET status='running', attempts=attempts+1, updated_at=? WHERE id=? AND status IN ('pending','authorized','retry_pending')")
     .run(now(), task.id);
   if (claim.changes !== 1) {
+    db().exec('ROLLBACK');
     return { ok: false, blocked: 'already_running', error: '任务已在运行或状态不允许执行' };
   }
 
-  const execId = newId('exe');
   db()
     .prepare('INSERT INTO executions (id,task_id,agent_id,status,model,session_key,started_at) VALUES (?,?,?,?,?,?,?)')
     .run(execId, task.id, null, 'running', 'claude-code-audit-isolated', '', now());
+  db().exec('COMMIT');
+  } catch(e) { db().exec('ROLLBACK'); return {ok:false,blocked:'audit_claim',error:e.message}; }
 
   const dest = join(JARVIS_HOME, 'audit', task.id);
   let credFile = null;
   let preserved = false;
   const modelToken = registerModelToken(execId, task.id);
   try {
+    validate(true);
     rmSync(dest, { recursive: true, force: true });
     mkdirSync(join(JARVIS_HOME, 'audit'), { recursive: true });
 
-    const wt = await executor.createWorktree({ repo: rc.cwd, commit, dest });
+    const wt = await executor.createWorktree({ repo: rc.cwd, commit, dest, audit:true });
+    validate(true);
     if (!wt.ok) {
       finalizeAttempt(task, execId, { status: 'failed', reason: `审计工作树创建失败: ${wt.error}` });
       return { ok: false, blocked: 'worktree_failed', error: wt.error };
     }
-    const init = await executor.worktreeStatus(dest);
+    const init = await executor.worktreeStatus(dest,{audit:true});
+    validate(true);
     if (!init.clean) {
       finalizeAttempt(task, execId, { status: 'failed', reason: '审计工作树初始不干净' });
       return { ok: false, blocked: 'dirty_worktree', error: '审计工作树初始不干净' };
     }
 
     const proxyUrl = await isolation.egressProxyUrl();
+    validate(true);
     const cred = writeCredentialFile(execId, proxyUrl, modelToken);
     if (!cred.ok) {
       finalizeAttempt(task, execId, { status: 'failed', reason: cred.error });
@@ -1468,7 +1508,7 @@ async function runAuditTask(task, project, deps = {}) {
       '## 被审计版本',
       `固定 commit: ${wt.sha}`,
       '',
-      '## 冻结的验收契约',
+      '## 固定审计依据',
       contract,
       '',
       '## 要求',
@@ -1494,7 +1534,7 @@ async function runAuditTask(task, project, deps = {}) {
         readOnly: true,
         tmpDir: auditTmp,
         proxyUrl,
-        guard: () => claimDockerInvocation(resourceId, task.id),
+        guard: () => { try { validate(true); } catch { return false; } return claimDockerInvocation(resourceId, task.id); },
         onStarted: () => markContainerRunning(resourceId)
       })
     });
@@ -1503,7 +1543,9 @@ async function runAuditTask(task, project, deps = {}) {
       return { ok: false, blocked: 'cancelled', error: '任务已取消，Audit 容器未启动' };
     }
 
-    const after = await executor.worktreeStatus(dest);
+    validate(true);
+    const after = await executor.worktreeStatus(dest,{audit:true});
+    validate(true);
     const evidence = {
       isolated: true,
       network: st.network,
@@ -1522,11 +1564,14 @@ async function runAuditTask(task, project, deps = {}) {
     finalizeAttempt(task, execId, { status: ok ? 'ok' : 'failed', reason, evidence, text: res.text });
 
     return { ...res, ok, evidence, task: getTask(task.id), execution: execId };
+  } catch(e) {
+    finalizeAttempt(task,execId,{status:getTask(task.id).status==='cancelled'?'cancelled':'failed',reason:e.message});
+    return {ok:false,blocked:'audit_scope',error:e.message};
   } finally {
     revokeModelToken(modelToken);
     try { if (credFile) rmSync(credFile, { force: true }); } catch {}
     if (!preserved) {
-      try { await executor.removeWorktree({ repo: rc.cwd, dest }); } catch {}
+      try { await executor.removeWorktree({ repo: rc.cwd, dest, audit:true }); } catch {}
     }
   }
 }
