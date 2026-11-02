@@ -77,3 +77,169 @@ jobs:
           printf 'HOST_MOUNT_CONTROLS_OK image=%s uid=1000 gid=1000\n' "$image_id"
       - name: unit + fault-injection tests
         run: node --test orchestrator/test/*.test.mjs
+      - name: collect original real SIGKILL evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 300 node --input-type=module <<'JARVIS_SIGKILL_EVIDENCE'
+          import { spawn, spawnSync } from 'node:child_process';
+          import { mkdtempSync, mkdirSync, readFileSync, readdirSync, lstatSync, realpathSync, rmSync } from 'node:fs';
+          import { join, resolve } from 'node:path';
+          import { createHash } from 'node:crypto';
+          import { DatabaseSync } from 'node:sqlite';
+          import { parseDockerEventLine } from './orchestrator/scripts/b03-docker-evidence.mjs';
+
+          const records = [], errors = [], root = mkdtempSync('/tmp/jarvis-sigkill-evidence-');
+          const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+          const requireFact = (ok, message) => { if (!ok) throw Error(message); };
+          const env = { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: join(root, 'home'), TMPDIR: join(root, 'tmp'), JARVIS_HOME: join(root, 'home'), JARVIS_DB: join(root, 'unused.db'), GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', DOCKER_CONFIG: join(root, 'docker') };
+          for (const dir of [env.HOME, env.TMPDIR, env.DOCKER_CONFIG]) mkdirSync(dir, { mode: 0o700 });
+          const script = 'orchestrator/scripts/verify-cancel-sigkill.mjs';
+          let docker, image, observer, observerDone, observerStopping = false, raw = Buffer.alloc(0), observerErr = Buffer.alloc(0), childResult, id, inspection, rows, since, replayRaw = Buffer.alloc(0);
+          const append = (before, chunk, limit) => {
+            if (before.length + chunk.length > limit) { errors.push('capture_limit_exceeded'); return before; }
+            return Buffer.concat([before, chunk]);
+          };
+          function command(bin, args, allowFailure = false) {
+            const result = spawnSync(bin, args, { env, timeout: 15000, maxBuffer: 1024 * 1024 });
+            const record = { command: [bin, ...args], status: result.status, signal: result.signal, error: result.error?.message, stdout: result.stdout?.toString() ?? '', stderr: result.stderr?.toString() ?? '' };
+            records.push(record);
+            if (!allowFailure) requireFact(result.status === 0 && !result.error && !result.signal, 'command failed: ' + JSON.stringify(record));
+            return record;
+          }
+          function emit(name, bytes) {
+            if (!Buffer.isBuffer(bytes)) bytes = Buffer.from(JSON.stringify(bytes));
+            console.log(`EVIDENCE_BEGIN ${name} bytes=${bytes.length} sha256=${hash(bytes)}`);
+            for (let offset = 0; offset < bytes.length; offset += 3072) console.log('EVIDENCE_BASE64 ' + bytes.subarray(offset, offset + 3072).toString('base64'));
+            console.log(`EVIDENCE_END ${name}`);
+          }
+          function readDatabase() {
+            const dirs = readdirSync(env.TMPDIR).filter(name => /^f3-sigkill-[A-Za-z0-9]+$/.test(name));
+            requireFact(dirs.length === 1, 'expected exactly one own script database directory');
+            const dir = join(env.TMPDIR, dirs[0]), dbPath = join(dir, 'state.db');
+            requireFact(lstatSync(dir).isDirectory() && !lstatSync(dir).isSymbolicLink() && realpathSync(dir) === dir, 'database directory escapes own root');
+            requireFact(lstatSync(dbPath).isFile() && !lstatSync(dbPath).isSymbolicLink() && realpathSync(dbPath) === dbPath, 'database path escapes own root');
+            const db = new DatabaseSync(dbPath, { readOnly: true });
+            try {
+              db.exec('BEGIN');
+              const result = Object.fromEntries(['projects', 'tasks', 'executions', 'execution_resources', 'events'].map(table => [table, db.prepare(`SELECT * FROM ${table} LIMIT 201`).all()]));
+              requireFact(Object.values(result).every(value => value.length < 201), 'database capture limit exceeded');
+              db.exec('COMMIT');
+              return { dbPath, tables: result };
+            } finally { db.close(); }
+          }
+          try {
+            requireFact(process.platform === 'linux' && process.versions.node.startsWith('24.'), 'hosted Linux Node24 required');
+            const head = command('/usr/bin/git', ['rev-parse', 'HEAD']).stdout.trim();
+            requireFact(/^[a-f0-9]{40}$/.test(head) && head === process.env.GITHUB_SHA, 'CI checkout SHA mismatch');
+            records.push({ head, script, scriptSha256: hash(readFileSync(script)), startedAt: new Date().toISOString() });
+            requireFact(hash(readFileSync(script)) === 'aa1df4811aa3e60791757666a8dfd5badebf4631d8fbc9a4944ad6bed77da539', 'original script changed');
+            docker = realpathSync('/Applications/Docker.app/Contents/Resources/bin/docker');
+            command(docker, ['version']);
+            image = command(docker, ['image', 'inspect', 'jarvis-executor:2.1.104', '--format', '{{.Id}}']).stdout.trim();
+            requireFact(/^sha256:[a-f0-9]{64}$/.test(image), 'invalid full image ID');
+            requireFact(command(docker, ['network', 'inspect', 'jarvis-internal', '--format', '{{.Internal}}']).stdout.trim() === 'true', 'noninternal network');
+            Object.assign(env, { JARVIS_DOCKER_BIN: docker, JARVIS_EXECUTOR_IMAGE: image, JARVIS_EXECUTOR_NETWORK: 'jarvis-internal' });
+            records.push({ childEnvironmentWhitelist: { ...env }, cwd: resolve('.'), node: process.version, image, network: 'jarvis-internal' });
+            since = new Date(Date.now() - 2000).toISOString();
+            observer = spawn(docker, ['events', '--since', since, '--filter', 'type=container', '--format', '{{json .}}'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+            observer.stdout.on('data', chunk => { raw = append(raw, chunk, 1024 * 1024); console.log('DOCKER_EVENT_CHUNK_BASE64 ' + chunk.toString('base64')); });
+            observer.stderr.on('data', chunk => { observerErr = append(observerErr, chunk, 65536); });
+            observerDone = new Promise(resolveDone => {
+              observer.on('error', error => { errors.push('observer_start_error:' + error.message); });
+              observer.on('close', (code, signal) => { if (!observerStopping) errors.push('observer_early_close'); resolveDone({ code, signal }); });
+            });
+            childResult = await new Promise(resolveDone => {
+              const child = spawn(process.execPath, [script], { env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+              let stdout = Buffer.alloc(0), stderr = Buffer.alloc(0), timedOut = false, startError;
+              const timer = setTimeout(() => { timedOut = true; try { process.kill(-child.pid, 'SIGKILL'); } catch (error) { errors.push('own_child_timeout_cleanup:' + error.message); } }, 180000);
+              child.stdout.on('data', chunk => { stdout = append(stdout, chunk, 262144); });
+              child.stderr.on('data', chunk => { stderr = append(stderr, chunk, 262144); });
+              child.on('error', error => { startError = error.message; });
+              child.on('close', (code, signal) => { clearTimeout(timer); resolveDone({ command: [process.execPath, script], code, signal, timedOut, startError, stdout: stdout.toString(), stderr: stderr.toString(), endedAt: new Date().toISOString() }); });
+            });
+          } catch (error) { errors.push(error.stack); }
+
+          // Snapshot committed WAL-visible rows and physical state before any cleanup, including failures.
+          try {
+            rows = readDatabase();
+            const tables = rows.tables;
+            requireFact(tables.executions.length === 1 && tables.execution_resources.length === 1, 'ambiguous execution/resources');
+            const ex = tables.executions[0], resource = tables.execution_resources[0];
+            const name = `jarvis-exec-${ex.id}`;
+            requireFact(/^exe_sigkill_[a-z0-9]+$/.test(ex.id) && resource.execution_id === ex.id && resource.task_id === ex.task_id && resource.name === name, 'DB identity mismatch');
+            requireFact(childResult?.stdout.includes('PASS  启动忽略 SIGTERM 的容器  :: ' + name + '\n'), 'stdout/DB identity mismatch');
+            const found = JSON.parse(command(docker, ['inspect', name]).stdout);
+            requireFact(found.length === 1, 'ambiguous Docker inspect');
+            inspection = found[0];
+            requireFact(/^[a-f0-9]{64}$/.test(inspection.Id) && inspection.Name === '/' + name && inspection.Config.Image === image && inspection.Image === image, 'container/image identity mismatch');
+            requireFact(JSON.stringify(inspection.Config.Entrypoint) === '["sh"]' && inspection.Config.Cmd?.length === 2 && inspection.Config.Cmd[0] === "-c" && inspection.Config.Cmd[1] === 'trap "" TERM; sleep 300', 'unexpected entrypoint/command');
+            requireFact(inspection.Mounts.length === 0 && JSON.stringify(Object.keys(inspection.NetworkSettings.Networks)) === '["jarvis-internal"]', 'unexpected mount/network');
+            id = inspection.Id; // Only the complete, cross-bound ID becomes eligible for cleanup.
+            command(docker, ['ps', '-a', '--no-trunc', '--filter', 'id=' + id, '--format', '{{json .}}']);
+            const task = tables.tasks.find(value => value.id === ex.task_id);
+            requireFact(task && tables.projects.some(value => value.id === task.project_id), 'missing task/project relationship');
+            requireFact(childResult.code === 0 && !childResult.signal && !childResult.timedOut && !childResult.startError, 'original script failed');
+            const checks = ['启动忽略 SIGTERM 的容器', '取消升级到 SIGKILL', '取消结果确认为已终止', '容器已停止（gone 或 exited）', '任务状态为 cancelled', '新进程读到终态且拒绝重复执行'];
+            const passLines = childResult.stdout.split('\n').filter(line => line.startsWith('PASS  '));
+            requireFact(passLines.length === 6 && checks.every(check => passLines.filter(line => line === 'PASS  ' + check || line.startsWith('PASS  ' + check + '  :: ')).length === 1) && childResult.stdout.includes('结果：6/6 通过') && !/^FAIL/m.test(childResult.stdout), 'original six checks missing');
+            requireFact(task.status === 'cancelled' && ex.status === 'cancelled' && resource.state === 'stopped' && inspection.State.Status === 'exited' && inspection.State.ExitCode === 137, 'cancel/physical state mismatch');
+            const cancelled = tables.events.filter(event => event.kind === 'task.cancelled' && event.project_id === task.project_id);
+            requireFact(cancelled.length === 1, 'missing cancellation payload');
+            const result = JSON.parse(cancelled[0].payload).results.find(value => value.execution === ex.id);
+            requireFact(result?.confirmedExit === true && result.containers.some(value => value.name === name && value.confirmed === true && value.escalated === true && value.killAccepted === true && value.containerState === 'exited'), 'incomplete real cancellation metadata');
+            records.push({ originalSpecialChecks: 6, nodeTestCountUnaffected: 334, physicalCancellationBeforeCleanup: true });
+          } catch (error) { errors.push(error.stack); }
+
+          // No cleanup may turn a failed cancellation into success; never operate on a name/prefix.
+          if (id) {
+            try {
+              if (inspection.State.Running) { errors.push('container_still_running_before_cleanup'); command(docker, ['rm', '-f', id]); }
+              else command(docker, ['rm', id]);
+              const remaining = command(docker, ['ps', '-a', '--no-trunc', '--filter', 'id=' + id, '--format', '{{.ID}}']).stdout.trim();
+              requireFact(remaining === '', 'owned container remains');
+              const gone = command(docker, ['inspect', id], true);
+              requireFact(gone.status !== 0 && !gone.error && /No such object|No such container/i.test(gone.stderr), 'inspect did not prove absent');
+              // Bounded --until query flushes destroy without relying on observer delivery timing.
+              const until = new Date().toISOString();
+              const replay = command(docker, ['events', '--since', since, '--until', until, '--filter', 'container=' + id, '--format', '{{json .}}']);
+              replayRaw = Buffer.from(replay.stdout);
+              records.push({ cleanup: 'complete-id only; destroy is cleanup, not cancellation', id, until });
+            } catch (error) { errors.push(error.stack); }
+          } else errors.push('unknown_container_identity_no_container_cleanup');
+          if (observer) {
+            observerStopping = true;
+            observer.kill('SIGTERM');
+            const timer = setTimeout(() => observer.kill('SIGKILL'), 5000);
+            records.push({ observer: await observerDone, stderr: observerErr.toString() });
+            clearTimeout(timer);
+            if (observerErr.length) errors.push('observer_stderr_not_empty');
+          }
+          if (raw.length && raw.at(-1) !== 10) errors.push("truncated_observer_JSONL");
+          raw = append(raw, replayRaw, 1024 * 1024);
+          try {
+            requireFact(raw.length > 0 && raw.at(-1) === 10, 'missing/truncated events JSONL');
+            const events = raw.toString().trimEnd().split('\n').map(parseDockerEventLine);
+            const own = events.filter(event => event.actorId === id);
+            requireFact(own.length > 0 && own.every(event => event.actorName === inspection.Name.slice(1)), 'event identity mismatch');
+            const unique = [...new Map(own.map(event => [event.raw, event])).values()].sort((a, b) => BigInt(a.timeNano) < BigInt(b.timeNano) ? -1 : BigInt(a.timeNano) > BigInt(b.timeNano) ? 1 : 0);
+            const actions = ['create', 'start', 'kill', 'kill', 'die', 'destroy'];
+            let cursor = 0;
+            for (const action of actions) {
+              const at = unique.findIndex((event, index) => index >= cursor && event.action === action && (action !== 'kill' || String(JSON.parse(event.raw).Actor.Attributes.signal) === (cursor <= 2 ? '15' : '9')));
+              requireFact(at >= 0, 'missing real lifecycle action ' + action);
+              cursor = at + 1;
+            }
+            records.push({ eventsRawLineCount: events.length, ownRawLineCount: own.length, ownUniqueLineCount: unique.length, lifecycle: unique.map(({ raw: ignored, ...event }) => event), clockScope: 'daemon event order only; not host cancellation-time proof' });
+          } catch (error) { errors.push(error.stack); }
+          records.push({ since, finishedAt: new Date().toISOString(), rawEventNewlineCount: [...raw].filter(byte => byte === 10).length });
+          emit('original-script-result', childResult ?? { notStarted: true });
+          emit('committed-database-rows', rows ?? { missing: true });
+          emit('pre-cleanup-inspect', inspection ?? { missing: true });
+          emit('docker-events-raw-jsonl', raw);
+          emit('commands-and-observations', records);
+          emit('errors', errors);
+          try { rmSync(root, { recursive: true }); } catch (error) { errors.push('own_root_cleanup:' + error.message); console.error(errors.at(-1)); }
+          console.log('SIGKILL_SPECIAL_RESULT ' + JSON.stringify({ passed: errors.length === 0, originalChecks: 6, errors: errors.length, scope: 'bounded hosted original SIGKILL/terminal-state case only; not full AC18/20/P0/P1' }));
+          process.exitCode = errors.length ? 1 : 0;
+          JARVIS_SIGKILL_EVIDENCE
