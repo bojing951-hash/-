@@ -1,69 +1,33 @@
 # 01 · 安装与 Node 版本策略
 
-## 环境基线（实测）
+当前为开发预览，外部用户从干净环境完成安装及账号接入的流程尚待验收。本文区分固定集成要求和原个人部署历史，不是自动安装、升级或接管现有服务的脚本。
 
-| 项 | 值 |
+## 固定集成版本
+
+| 项目 | 要求或本次观察 |
 |---|---|
-| 系统 | macOS 15.6.1 (24G90) |
-| 芯片 | Apple M4 / arm64 |
-| 系统 Node | v24.13.1（**不满足要求**） |
-| npm | 11.8.0 |
-| brew | 未安装 |
+| OpenClaw | 固定核对版本 `2026.10.9 (8b18b55)`，不代表当前最新版 |
+| Node engines | `>=24.22.1 <25 || >=26.12.1`，Node 25 不在该范围内 |
+| 本次实际私有 Node | `24.22.1` |
+| orchestrator 单独声明 | `package.json` 为 Node `>=24`；与上述 OpenClaw 集成时必须同时满足更严格的 engines |
 
-## 版本要求
+不要沿用旧文档的 24.16 / 26.1 下限，也不要把滚动 `latest` 安装当成固定版本复现。
 
-OpenClaw 要求 **Node 24.16.0+（24.x）或 26.1.0+**，并建议 24.22.1+ / 26.12.1+（修复了 `node:sqlite` 的 NUL 截断问题）。
+## 安装前核对
 
-本机 24.13.1 低于下限，`npm install -g openclaw` 会装出无法运行的版本。
+- 先确定独立目录、私有运行时与配置/状态位置；不要覆盖现有 `.openclaw`、生产数据库或 shell 配置。
+- 只从官方来源取得固定版本并核对包内容及摘要，检查安装生命周期行为后再执行。当前仓库未提供已独立通过的通用安装器。
+- OpenClaw CLI 必须可找到正确的 Node；仅下层 `orchestrator` 无第三方依赖，不意味着 OpenClaw 无依赖。
+- 安装、账号录入、模型验证、飞书切换分别进行；安装完成不证明其他环节通过。
 
-## 三种安装方式怎么选
+## 原个人部署环境（历史）
 
-| 方式 | 命令 | 适用 |
-|---|---|---|
-| 本地前缀（**本次采用**） | `install-cli.sh --prefix ~/.openclaw` | 想把 Node 和 CLI 关在自己目录里，不动系统 |
-| 官方一键 | `install.sh` | 愿意让它接管/升级 Node |
-| npm 全局 | `npm i -g openclaw@latest --allow-scripts=openclaw` | 你自己管理 Node 且版本已达标 |
+原记录机器为 macOS 15.6.1 (24G90)、Apple M4 / arm64，系统 Node 24.13.1、npm 11.8.0、未安装 brew。该 Node 不满足本页固定 OpenClaw 的要求，所以当时选择私有 Node 24.22.1，不改系统 Node。
 
-选本地前缀的理由：**不改动全局 Node**，因此 Claude Code、nvm 默认版本、其他工具全部不受影响。
+原流程采用官方 `install-cli.sh` 的本地前缀模式，记录过滚动安装获得 OpenClaw 2026.10.9。远端脚本可能变化，原脚本摘要只属于当次下载，不能用于证明今天下载的内容相同，也不能证明对所有机器可复现。原结果见 [历史验收报告](06-acceptance-report.md)。
 
-## 实际执行的命令
+官方前缀安装、系统级安装和全局 npm 安装会影响不同目录，应按实际机器和授权范围另行审阅。本页不引导执行滚动安装或修改全局 PATH。
 
-```bash
-# 先下载审阅，不盲管道执行
-curl -fsSL https://openclaw.ai/install-cli.sh -o /tmp/oc-install-cli.sh
-shasum -a 256 /tmp/oc-install-cli.sh
-# 4b02806b3bd59eba236e8cdcf2cef93ef0bcdf5324dfd5ecbd1aaa7b66ac8a97
+## 检查边界
 
-/bin/bash /tmp/oc-install-cli.sh --prefix "$HOME/.openclaw" --no-onboard --json
-```
-
-安装结果：
-
-```text
-node 24.22.1 installed      → ~/.openclaw/tools/node-v24.22.1
-openclaw latest installed   → ~/.openclaw/bin/openclaw
-OpenClaw 2026.10.9 (8b18b55)
-```
-
-## 安装来源核验
-
-- npm 包：`openclaw@2026.10.9`，MIT，仓库 `github.com/openclaw/openclaw`
-- 维护者：`steipete`、`vincentkoc`
-- 脚本经 TLS 直连 `openclaw.ai` 获取，执行前已本地审阅，未安装任何第三方插件
-
-## PATH
-
-安装器不会自动改 shell 配置，需自己加：
-
-```bash
-echo 'export PATH="$HOME/.openclaw/bin:$PATH"' >> ~/.zshrc   # 注意是 .zshrc，不是 .zprofile
-```
-
-`.zshrc` 只对交互式 shell 生效，`zsh -lc` 验证不到，属正常。
-
-## 验证
-
-```bash
-openclaw --version      # OpenClaw 2026.10.9 (8b18b55)
-openclaw doctor
-```
+运行版本查询只能确认当前命令解析到的程序，不能证明 MCP、Gateway 与手机使用了同一版本。完整交付还需核对启动入口、独立状态、停止恢复、模型及手机业务流程；当前 P0 与 P1 完整验收仍 WAITING。返回 [项目当前状态](../README.md)。

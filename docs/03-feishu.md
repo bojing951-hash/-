@@ -1,5 +1,9 @@
 # 03 · 飞书通道
 
+本页保留原个人部署的配置形式及访问控制说明，适用于当时版本，不是已完成的新 P1 安装/验收流程。截至 2026-11-03，手机九项完整独立验收为 0/9。已有 BOT 对话正常不证明新版通过。
+
+接入前先明确机器人、插件精确版本、测试账号、状态目录和切换恢复窗口。原 BOT 保持原连接，不双连抢事件；以下安装、配置、发消息、probe 及 reload 均可能产生外部效果，不能整段自动执行。尚未核定可复现的飞书插件版本，不把滚动插件安装当作固定版本复现。
+
 ## 前置：飞书开放平台
 
 在 <https://open.feishu.cn> 的企业自建应用里需要具备：
@@ -36,18 +40,15 @@ openclaw config set channels.feishu.allowBots false --strict-json
 openclaw config set commands.ownerAllowFrom '["feishu:ou_你的open_id"]' --strict-json
 ```
 
-## App Secret 走 SecretRef，不落明文
+## 凭据存储边界与历史脚本
 
-```bash
-bash scripts/secure-credential-input.sh
-openclaw secrets store import --from ~/.openclaw/.private/feishu.env --kind secret --yes
-openclaw config set channels.feishu.accounts.default.appSecret \
-  --ref-provider default --ref-source store --ref-id FEISHU_APP_SECRET
-rm -P ~/.openclaw/.private/feishu.env
-openclaw secrets reload
-```
+SecretRef 让配置保存引用名，**不等于凭据加密或从不落明文**。本次核对的 OpenClaw native store 为未静态加密的 SQLite，需要私密目录和文件权限保护。凭据、数据库及侧文件不可进入 Git、聊天、公开日志或归档。
 
-配置文件里最终只有：
+仓库中的 `scripts/secure-credential-input.sh` 仅作历史参考：静默输入后，会把飞书 App ID / App Secret 写入权限 0600 的 `.private/feishu.env` **明文临时文件**；长度大于 40 且满足脚本条件时，会截为前 32 字符。这不是任意凭据的安全通用录入器，**不得用于 GLM 或其他 API key**。本页不推荐直接运行它录入新凭据，也不把静默输入、0600 或 SecretRef 称为加密。
+
+历史流程曾从该临时文件导入 store 后删除文件。删除（包括 `rm -P`）不能保证 SSD、快照及备份上的安全擦除。新接入应另行核验官方隐藏输入流程、存储位置和清理范围，不把秘密放入命令参数或环境导出。
+
+配置最终引用的历史示意为：
 
 ```json
 "appSecret": { "source": "store", "provider": "default", "id": "FEISHU_APP_SECRET" }
@@ -89,7 +90,9 @@ done
 
 `doc` 的风险点：`feishu_doc create` 会把文档权限授予发起人，属于意外提权面。
 
-## 验证
+## 历史连接检查示例
+
+需在约定的测试窗口执行；该输出示例不是当前新版手机验收结果。
 
 ```bash
 openclaw channels status --probe
@@ -103,3 +106,5 @@ openclaw channels status --probe
 ```bash
 openclaw config set channels.feishu.streaming.mode off
 ```
+
+原部署结果见 [历史验收报告](06-acceptance-report.md)，当前交付边界见 [项目状态](../README.md)。外部干净安装、模型账号、原安全门禁及手机全流程仍待验。

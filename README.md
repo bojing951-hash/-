@@ -1,124 +1,70 @@
-# 贾维斯编程 · JARVIS × OpenClaw 部署配置
+# JARVIS · 通用个人 AI 助手（开发预览）
 
-把 **飞书 → OpenClaw → GLM** 这条链路在本机跑通的完整、可复现的配置与验收记录。
+本仓库包含 `orchestrator/` 调度层源码、配置模板和原个人部署记录。目标是从手机飞书入口管理项目、Agent、任务、交接与审计，底层复用 OpenClaw。当前尚未完成稳定使用及对外安装交付验收。
 
-手机上的飞书私聊就是入口：JARVIS 负责对话、记录想法、维护长期记忆，未来再挂接 Claude Code、Codex 等专业 Agent。
+## 当前范围与验收状态
 
-> 本仓库只包含**配置与人设**，不含任何 API Key、Gateway Token、App Secret、聊天记录或会话数据库。
+以下为截至 2026-11-03 的研发检查点摘要；实现、局部验证和完整验收分别列出。
 
-## 架构
+| 部分 | 当前状态 |
+|---|---|
+| P1 调度层 | 已有九项 MVP 能力的实现路径，包含项目、会话、任务、工作流和只读审计；不等于手机验收通过 |
+| 固定基线 CI | `fc73c0a` 的 Node 测试 334/334、零失败零跳过；原 SIGKILL 专项另为 6/6，不是 340 项 Node 测试，也不是完整 P0 |
+| 当前 Mac 独立环境 | Node 24.22.1 / OpenClaw 2026.10.9 的无账号 CLI、MCP、SQLite 和本机 Gateway 已有有界验证 |
+| 当前 GLM 接入 | 凭据保存元数据已确认；一次 CLI 探测返回零目标，未获得有效模型结果；真实认证、模型响应及上游 HTTP 次数均 UNKNOWN |
+| P0 原正式安全门禁 | WAITING，原生命周期、竞态、可信时钟、设备及合法模型等证据仍待补齐 |
+| P1 手机飞书完整独立验收 | 0/9，尚未完成 |
+| 外部用户干净安装 | 尚待验证，不提供已通过的一键安装承诺 |
+| P2 / P3 | 后续扩展，尚未形成完整通用个人 AI 操作系统 |
 
-```text
-iPhone 飞书  ──WebSocket 长连接──▶  OpenClaw Gateway (127.0.0.1:18789)
-                                          │
-                                          ├─ Agent: JARVIS（中文、结论先行）
-                                          ├─ 模型: zai/glm-5.3（智谱 Coding Plan CN）
-                                          └─ 记忆: workspace 内 Markdown + 关键词索引
-```
+此表中的 CI 数字仅归属所列固定基线；后续文档提交不自动获得该 SHA 的测试结论。已有另一台机器的飞书对话正常，是旧环境事实，不能证明新版九项能力通过。
 
-## 当前实测状态
-
-| 项目 | 状态 | 证据 |
-|---|---|---|
-| OpenClaw | ✅ | `2026.10.9 (8b18b55)` |
-| 私有 Node 运行时 | ✅ | `v24.22.1`（系统 Node 过旧，未改动全局） |
-| GLM 模型 | ✅ | 实际调用 `zai/glm-5.3` 返回中文答复 |
-| Gateway | ✅ | loopback、token 认证、LaunchAgent 常驻、被 kill 后 5s 自动拉起 |
-| 飞书通道 | ✅ | WebSocket `connected, works`，收发双向验证 |
-| 安全审计 | ✅ | `0 critical`，exec 实测不可用 |
-| 手机端 | ✅ | iPhone 私聊实测收到回复 |
-
-## P1：通用多模型 / 多会话 / 多 Agent 调度
-
-在 MVP 基础上新增 `orchestrator/`：一层薄调度，复用 OpenClaw 的 Agent、Session、Provider，
-只补它没有的**项目、任务、交接、工作流**。
+## 产品结构
 
 ```text
-飞书 / CLI / MCP
-      ↓
-orchestrator（新增，~1000 行，零依赖）
-  Project · Task · Workflow · Execution
-      ↓  只调用 CLI
-OpenClaw（复用）
-  Agent · Session · Provider · Gateway
-      ├── GLM (zai)
-      └── Claude Code（外部执行器，独立进程）
+手机飞书 / CLI / MCP
+        ↓
+orchestrator：Project · Task · Workflow · Execution
+        ↓
+OpenClaw：Agent · Session · Provider · Gateway
 ```
 
-核心原则：**模型、Agent 角色、独立会话、项目、任务、执行工具是六种不同对象**，
-`agent set-model` 换模型不动角色与会话，`agent set-role` 改角色不动模型。
+模型、Agent 角色、会话、项目、任务与执行工具是不同对象。项目目标及实现说明见 [架构](docs/07-architecture.md) 和 [调度层用法](orchestrator/README.md)。
 
-- 架构说明：[docs/07-architecture.md](docs/07-architecture.md)
-- 测试结果：[docs/08-test-results.md](docs/08-test-results.md)
-- 安全审查：[docs/09-security-review.md](docs/09-security-review.md)
-- 功能状态：[docs/10-status.md](docs/10-status.md)
-- 调度层用法：[orchestrator/README.md](orchestrator/README.md)
-- 飞书使用手册：[docs/11-usage.md](docs/11-usage.md)
+## 使用前准备
 
-已验证：多模型独立会话、跨 Agent 真实交接、并行研究→汇总工作流、人工审批门、
-Gateway 重启后状态恢复、Claude Code + GLM 只读与写模式执行、测试校验、Git 提交、
-任务取消、完成通知、固定 commit 的只读审计。
+1. 使用独立测试目录、测试数据和明确授权范围；保留现役服务及备份，不直接把新版源码指向旧数据库。
+2. 固定集成版本为 **OpenClaw 2026.10.9**，其 Node 要求为 **`>=24.22.1 <25 || >=26.12.1`**；本次实际私有运行时为 24.22.1。见 [安装说明](docs/01-install.md)。
+3. 国内智谱 Coding Plan 明确选择 `zai-coding-cn`；账号录入和一次受限验证需分别确认。见 [模型接入边界](docs/02-model-glm.md)。不要把 key 粘贴到聊天、命令参数、环境导出或日志。
+4. 飞书接入需单独确认机器人、插件版本、权限及切换恢复窗口，不能双连抢占现役 BOT 的事件。见 [飞书说明](docs/03-feishu.md)。
 
-自检命令：
+当前安装、账号接入、原安全门禁及手机全流程仍需逐项验证；下列历史材料不是新安装者可直接执行的自动接管流程。
 
-```bash
-~/.openclaw/tools/node/bin/node ~/JarvisCoding/orchestrator/src/cli.mjs doctor
-```
+## 原个人部署历史
 
-未验证（WAITING）：GPT / Claude / DeepSeek 真实 API 会话——本机无对应凭据。
+原环境曾记录 GLM 中文回复、飞书收发、iPhone 回复、Gateway 恢复及局部审查。这些属于当时机器、配置与代码的历史观察，不是当前新版的整体验收。
 
-## 快速开始
+- [原安装与版本记录](docs/01-install.md)
+- [原部署验收报告](docs/06-acceptance-report.md)
+- [历史调度测试记录](docs/08-test-results.md)
+- [历史安全审查](docs/09-security-review.md)
+- [历史功能状态](docs/10-status.md)
+- [飞书使用手册](docs/11-usage.md)
 
-```bash
-# 1. 安装（官方本地前缀模式，不需要 sudo）
-curl -fsSL https://openclaw.ai/install-cli.sh | bash -s -- --prefix "$HOME/.openclaw" --no-onboard
-export PATH="$HOME/.openclaw/bin:$PATH"
-openclaw --version
-
-# 2. 初始化 + GLM（把 <YOUR_GLM_KEY> 换成你自己的）
-openclaw onboard --non-interactive --accept-risk \
-  --mode local --auth-choice zai-coding-cn --zai-api-key "<YOUR_GLM_KEY>" \
-  --agent-name JARVIS --gateway-bind loopback \
-  --install-daemon --daemon-runtime node \
-  --skip-search --skip-skills --skip-hooks --skip-ui --skip-channels
-
-# 3. 飞书通道（插件 + 凭据安全录入，见 docs/03-feishu.md）
-openclaw plugins install @openclaw/feishu
-bash scripts/secure-credential-input.sh
-
-# 4. 验收
-openclaw gateway status
-openclaw channels status --probe
-openclaw security audit
-```
+旧报告保留其原始结论和适用范围，阅读时应结合上方当前状态。
 
 ## 仓库结构
 
 ```text
-agents/     JARVIS 人设：SOUL.md（职责与边界）、IDENTITY.md、USER.md（用户偏好）
-config/     openclaw.template.json —— 已脱敏的最终配置模板
-docs/       安装、模型、飞书、安全、排错、验收报告
-scripts/    凭据安全录入脚本（不回显、不进历史记录）
+orchestrator/  调度层源码、CLI、MCP、测试及执行器说明
+agents/        JARVIS 人设与偏好模板
+config/        配置模板
+docs/         安装、模型、飞书、架构与历史报告
+scripts/       历史辅助脚本；凭据录入脚本限制见飞书说明
 ```
 
-## 关键设计取舍
+凭据采用 SecretRef 时，配置保存的是引用；**引用不等于加密**。本次核对的 native store 为未静态加密的 SQLite，需要目录和文件权限保护，不能提交或分享其数据库及侧文件。
 
-- **不改动系统 Node**：要求 Node ≥ 24.16，本机是 24.13.1，因此用私有运行时，Claude Code 等既有工具完全不受影响。
-- **凭据不进配置文件**：飞书 App Secret 以 SecretRef 形式指向加密 store，配置里只有引用名。
-- **最小权限**：`messaging` 工具面 + 仅追加文件/记忆工具，文件访问锁定在 workspace，`exec` 与 Code Mode 关闭。
-- **只认一个主人**：飞书私聊走 open_id 白名单，群聊整体禁用，不接收其他机器人消息。
+## 发布与许可
 
-## 文档
-
-| 文档 | 内容 |
-|---|---|
-| [docs/01-install.md](docs/01-install.md) | 安装与 Node 版本策略 |
-| [docs/02-model-glm.md](docs/02-model-glm.md) | GLM / Z.AI 四种端点选择 |
-| [docs/03-feishu.md](docs/03-feishu.md) | 飞书应用、WebSocket、访问控制 |
-| [docs/04-security.md](docs/04-security.md) | 权限模型与审计结果 |
-| [docs/05-troubleshooting.md](docs/05-troubleshooting.md) | 实际踩到的 6 个坑 |
-| [docs/06-acceptance-report.md](docs/06-acceptance-report.md) | 完整验收记录 |
-
-## 说明
-
-本项目是**个人部署配置**，不是 OpenClaw 官方项目。OpenClaw 版权归其作者所有（MIT），详见 <https://github.com/openclaw/openclaw>。
+仓库已可在 GitHub 阅读，但当前是开发预览，正式发布仍待用户决定。本仓库尚未提供自身 LICENSE，许可待明确；不能把上游许可当作本仓库许可。OpenClaw 版权及 MIT 许可属于其作者，见 [上游仓库](https://github.com/openclaw/openclaw)。

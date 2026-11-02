@@ -1,72 +1,28 @@
-# 02 · GLM 模型接入
+# 02 · GLM 模型接入边界
 
-## Provider
+本文以固定 OpenClaw 2026.10.9 的 `zai` provider / `@openclaw/zai-provider` 为背景；模型引用示例为 `zai/glm-5.3`，认证名称为 `ZAI_API_KEY`。名称或模型清单出现，不代表账号已获授权或真实请求成功。
 
-GLM 不是一个独立 provider，而是 `zai` provider 下的模型族，引用写法 `zai/glm-5.3`。
+## 明确选择账户区域与额度
 
-| 项 | 值 |
+| 初始化选项 | Base URL |
 |---|---|
-| Provider | `zai` |
-| 插件 | `@openclaw/zai-provider` |
-| 认证 | `ZAI_API_KEY` |
-| 协议 | OpenAI Chat Completions（Bearer） |
+| `zai-global` | `https://api.z.ai/api/paas/v4` |
+| `zai-cn` | `https://open.bigmodel.cn/api/paas/v4` |
+| `zai-coding-global` | `https://api.z.ai/api/coding/paas/v4` |
+| `zai-coding-cn` | `https://open.bigmodel.cn/api/coding/paas/v4` |
 
-## 四个端点（选错区域是最常见的失败原因）
+国内智谱 Coding Plan 应明确选择 **`zai-coding-cn`**，避免自动探测后选到普通 API 额度。默认模型与可用额度需以已安装版本和实际账号为准，不自动换端点或模型。
 
-| 初始化选项 | Base URL | 默认模型 |
-|---|---|---|
-| `zai-global` | `https://api.z.ai/api/paas/v4` | glm-5.2 |
-| `zai-cn` | `https://open.bigmodel.cn/api/paas/v4` | glm-5.2 |
-| `zai-coding-global` | `https://api.z.ai/api/coding/paas/v4` | glm-5.3 |
-| `zai-coding-cn` | `https://open.bigmodel.cn/api/coding/paas/v4` | glm-5.3 |
+## 账号录入与验证分别处理
 
-`zai-api-key` 会用你的 Key 依次探测并自动选中，顺序是 general 优先于 coding。**如果 Key 两个都能用、你买的是 Coding Plan，必须显式指定**，否则可能落到普通 API 额度上。
+不要把 key 发送到聊天、放入命令参数或环境导出，也不要打印认证预览。本页不再提供携带 key 的非交互初始化命令，不把未经核验的隐藏输入参数写成通用安装步骤。
 
-## 本机实际选择
+本次测试通过官方本机隐藏输入保存凭据，只查询名称和非秘密元数据。native store 是未静态加密的 SQLite，SecretRef 仅引用名称；目录、数据库、侧文件、临时认证资料都必须私密保存并排除 Git、日志与证据归档。不要复制现有工具或其他机器的凭据来完成接入。
 
-Claude Code 原来配的是：
+单独安排受限模型验证，事前明确供应商、模型、请求预算、网络限制、停止条件及数据范围。模型验证不自动启用业务工具、飞书或设备。返回限流、错误或未知结果时先保留证据，不自动重试、切换模型或补发。
 
-```text
-ANTHROPIC_BASE_URL = https://open.bigmodel.cn/api/anthropic
-ANTHROPIC_MODEL    = glm-5.3
-```
+## 当前验证结果
 
-这是智谱的 **Anthropic 兼容** coding 端点。OpenClaw 走 OpenAI 协议，所以换成同区域的对应端点：
+截至 2026-11-03，凭据保存元数据已确认；一次受限 CLI 逻辑探测返回零目标，未获得有效模型结果。真实认证、模型响应和上游 HTTP 次数均 **UNKNOWN**，不能据此判定 key 错误、认证成功或请求次数为零。该次许可已使用，下一次真实请求需另行确定具体方案及授权。
 
-```text
-zai-coding-cn → https://open.bigmodel.cn/api/coding/paas/v4
-```
-
-**同一个 Key 直接复用，没有覆盖 Claude Code 的任何配置**——两者读的是不同文件、不同变量。
-
-## 非交互式初始化
-
-```bash
-openclaw onboard --non-interactive --accept-risk \
-  --mode local \
-  --auth-choice zai-coding-cn \
-  --zai-api-key "$GLM_KEY" \
-  --agent-name JARVIS \
-  --gateway-bind loopback \
-  --install-daemon --daemon-runtime node \
-  --skip-search --skip-skills --skip-hooks --skip-ui --skip-channels
-```
-
-`--accept-risk` 是非交互模式必需的显式风险确认，不是可选项。
-
-## 验证
-
-```bash
-openclaw models list --all --provider zai
-openclaw agent --agent jarvis --message "用一句话回答你是谁" --json
-```
-
-真实的调用证据在 `executionTrace` 里：
-
-```json
-{ "winnerProvider": "zai", "winnerModel": "glm-5.3", "attempts": [{"result": "success"}] }
-```
-
-## 限流
-
-Coding Plan 是容量管理服务，高峰期（新加坡时间 14–18 点）可能返回 `429` 或错误码 `1302` / `1305`。属于正常波动，重试即可；非高峰期持续失败才是配置问题。
+原个人部署曾记录 GLM 中文回复及不同兼容协议端点的使用，属于 [历史验收报告](06-acceptance-report.md) 的环境；不能据此承诺本次模型接入或全部多模型会话已验收。P0 及九项手机业务独立验收仍 WAITING，见 [当前状态](../README.md)。
