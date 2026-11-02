@@ -259,21 +259,49 @@ function finishExecution(execId, res) {
 /* ----------------------------------- Tasks ----------------------------------- */
 
 export function createAuditTask(args) {
-  const fields=['project','title','repo','commit','contract_commit','contract_path'];
-  if (!args || Object.keys(args).length!==6 || Object.keys(args).some(k=>!fields.includes(k)) || fields.some(k=>typeof args[k]!=='string' || !args[k].trim() || Buffer.byteLength(args[k])>4096) || args.title.length>256) throw new Error('audit_create 仅接受六个必填字符串');
-  const project=getProject(args.project);
-  const repository=ex.auditRepository(args.repo,project.dir,args.commit);
-  const contract=ex.auditContract(repository.repo.path,args.contract_commit,args.contract_path);
-  return createTask({project:project.id,title:args.title,kind:'audit',executorConfig:{repo:repository.repo.path,commit:args.commit,contract:contract.text,contract_source:contract.source}});
+  const fields = ['project', 'title', 'repo', 'commit', 'contract_commit', 'contract_path'];
+  const invalid = !args || Object.keys(args).length !== fields.length ||
+    Object.keys(args).some(key => !fields.includes(key)) ||
+    fields.some(key => typeof args[key] !== 'string' || !args[key].trim() || Buffer.byteLength(args[key]) > 4096) ||
+    args.title.length > 256;
+  if (invalid) throw new Error('audit_create 仅接受六个必填字符串');
+  const project = getProject(args.project);
+  const repository = ex.auditRepository(args.repo, project.dir, args.commit);
+  const contract = ex.auditContract(repository.repo.path, args.contract_commit, args.contract_path);
+  return createTask({
+    project: project.id,
+    title: args.title,
+    kind: 'audit',
+    executorConfig: {
+      repo: repository.repo.path,
+      commit: args.commit,
+      contract: contract.text,
+      contract_source: contract.source
+    }
+  });
 }
+
 function auditScope(id, project, cfg) {
-  if (typeof cfg.contract!=='string' || !cfg.contract.trim() || Buffer.byteLength(cfg.contract)>262144) throw new Error('审计必须提供 contract');
-  const repository=ex.auditRepository(cfg.repo,project.dir,cfg.commit);
-  if(cfg.contract_source) {
-    const c=ex.auditContract(repository.repo.path,cfg.contract_source.commit,cfg.contract_source.path);
-    if(c.text!==cfg.contract || canonicalJson(c.source)!==canonicalJson(cfg.contract_source)) throw new Error('固定契约来源漂移');
+  if (typeof cfg.contract !== 'string' || !cfg.contract.trim() || Buffer.byteLength(cfg.contract) > 262144) {
+    throw new Error('审计必须提供 contract');
   }
-  return {task_id:id,project_id:project.id,repository,contract_sha256:sha256(cfg.contract),contract_source:cfg.contract_source??null,runner:'claude-code',mode:'plan',readOnly:true};
+  const repository = ex.auditRepository(cfg.repo, project.dir, cfg.commit);
+  if (cfg.contract_source) {
+    const contract = ex.auditContract(repository.repo.path, cfg.contract_source.commit, cfg.contract_source.path);
+    if (contract.text !== cfg.contract || canonicalJson(contract.source) !== canonicalJson(cfg.contract_source)) {
+      throw new Error('固定契约来源漂移');
+    }
+  }
+  return {
+    task_id: id,
+    project_id: project.id,
+    repository,
+    contract_sha256: sha256(cfg.contract),
+    contract_source: cfg.contract_source ?? null,
+    runner: 'claude-code',
+    mode: 'plan',
+    readOnly: true
+  };
 }
 
 export function createTask({ project: projectRef, title, input, assignee, kind, needsApproval, maxAttempts, parentTaskId, workflowId, executor, executorConfig }) {
@@ -282,10 +310,10 @@ export function createTask({ project: projectRef, title, input, assignee, kind, 
   const a = assignee ? getAgent(assignee, project.id) : null;
   if (a && a.project_id !== project.id) throw new Error('Agent 不属于该项目，禁止跨项目直接指派');
   const id = newId('tsk');
-  if(kind==='audit') {
-    if(Object.hasOwn(executorConfig??{},'scope')) throw new Error('不接受调用方审计快照');
-    executorConfig={...executorConfig,scope:auditScope(id,project,executorConfig??{})};
-    executor='claude-code';
+  if (kind === 'audit') {
+    if (Object.hasOwn(executorConfig ?? {}, 'scope')) throw new Error('不接受调用方审计快照');
+    executorConfig = { ...executorConfig, scope: auditScope(id, project, executorConfig ?? {}) };
+    executor = 'claude-code';
   }
   const t = now();
   db()
@@ -1441,13 +1469,30 @@ async function runAuditTask(task, project, deps = {}) {
   }
 
   const validate = (running = false) => {
-    const fresh=getTask(task.id), p=getProject(fresh.project_id), c=JSON.parse(fresh.executor_config||'{}');
-    if(p.status!=='active' || ! (running ? ['running'] : ['pending','authorized','retry_pending']).includes(fresh.status)) throw new Error('审计暂停、取消或状态不允许');
-    if(fresh.project_id!==project.id || fresh.kind!=='audit' || !c.scope || canonicalJson(c)!==canonicalJson(cfg) || canonicalJson(auditScope(fresh.id,p,c))!==canonicalJson(c.scope)) throw new Error('审计范围快照缺失或漂移');
+    const fresh = getTask(task.id);
+    const currentProject = getProject(fresh.project_id);
+    const currentConfig = JSON.parse(fresh.executor_config || '{}');
+    const allowed = running ? ['running'] : ['pending', 'authorized', 'retry_pending'];
+    if (currentProject.status !== 'active' || !allowed.includes(fresh.status)) {
+      throw new Error('审计暂停、取消或状态不允许');
+    }
+    if (fresh.project_id !== project.id || fresh.kind !== 'audit' || !currentConfig.scope ||
+        canonicalJson(currentConfig) !== canonicalJson(cfg) ||
+        canonicalJson(auditScope(fresh.id, currentProject, currentConfig)) !== canonicalJson(currentConfig.scope)) {
+      throw new Error('审计范围快照缺失或漂移');
+    }
   };
-  try { validate(); } catch(e) { return {ok:false,blocked:'audit_scope',error:e.message}; }
+  try {
+    validate();
+  } catch (error) {
+    return { ok: false, blocked: 'audit_scope', error: error.message };
+  }
   const st = await isolation.isolationStatus();
-  try { validate(); } catch(e) { return {ok:false,blocked:'audit_scope',error:e.message}; }
+  try {
+    validate();
+  } catch (error) {
+    return { ok: false, blocked: 'audit_scope', error: error.message };
+  }
   if (!st.available) {
     recordAttempt({ task, project, phase: 'isolation', status: 'rejected', blocked: 'isolation_unavailable', reason: st.reason });
     return { ok: false, blocked: 'isolation_unavailable', error: st.reason };
@@ -1456,124 +1501,178 @@ async function runAuditTask(task, project, deps = {}) {
   const execId = newId('exe');
   db().exec('BEGIN IMMEDIATE');
   try {
-  validate();
-  const claim = db()
-    .prepare("UPDATE tasks SET status='running', attempts=attempts+1, updated_at=? WHERE id=? AND status IN ('pending','authorized','retry_pending')")
-    .run(now(), task.id);
-  if (claim.changes !== 1) {
+    validate();
+    const claim = db()
+      .prepare("UPDATE tasks SET status='running', attempts=attempts+1, updated_at=? WHERE id=? AND status IN ('pending','authorized','retry_pending')")
+      .run(now(), task.id);
+    if (claim.changes !== 1) {
+      db().exec('ROLLBACK');
+      return { ok: false, blocked: 'already_running', error: '任务已在运行或状态不允许执行' };
+    }
+    db()
+      .prepare('INSERT INTO executions (id,task_id,agent_id,status,model,session_key,started_at) VALUES (?,?,?,?,?,?,?)')
+      .run(execId, task.id, null, 'running', 'claude-code-audit-isolated', '', now());
+    db().exec('COMMIT');
+  } catch (error) {
     db().exec('ROLLBACK');
-    return { ok: false, blocked: 'already_running', error: '任务已在运行或状态不允许执行' };
+    return { ok: false, blocked: 'audit_claim', error: error.message };
   }
 
-  db()
-    .prepare('INSERT INTO executions (id,task_id,agent_id,status,model,session_key,started_at) VALUES (?,?,?,?,?,?,?)')
-    .run(execId, task.id, null, 'running', 'claude-code-audit-isolated', '', now());
-  db().exec('COMMIT');
-  } catch(e) { db().exec('ROLLBACK'); return {ok:false,blocked:'audit_claim',error:e.message}; }
-
   const dest = join(JARVIS_HOME, 'audit', task.id);
+  const head = { expected: commit.toLowerCase() };
+  const evidence = {
+    isolated: true,
+    network: st.network,
+    image: st.image,
+    audit: { repo: rc.cwd, commit: head.expected, contract_sha256: sha256(contract), head }
+  };
+  const checkHead = (phase) => {
+    const check = { observed: null };
+    head[phase] = check;
+    try {
+      check.observed = ex.auditWorktreeHead(dest);
+      if (check.observed !== head.expected) throw new Error('审计工作树 HEAD 与固定版本不符');
+    } catch (error) {
+      check.error = error.message;
+      throw error;
+    }
+  };
   let credFile = null;
-  let preserved = false;
+  let worktreeAttempted = false;
+  let result;
+  let completion = 'failed';
+  let reason = '';
   const modelToken = registerModelToken(execId, task.id);
   try {
-    validate(true);
-    rmSync(dest, { recursive: true, force: true });
-    mkdirSync(join(JARVIS_HOME, 'audit'), { recursive: true });
+    // Keep early returns inside this operation; the outer path always cleans up
+    // before it commits a successful Task/Execution result.
+    result = await (async () => {
+      validate(true);
+      rmSync(dest, { recursive: true, force: true });
+      mkdirSync(join(JARVIS_HOME, 'audit'), { recursive: true });
+      worktreeAttempted = true;
+      const wt = await executor.createWorktree({ repo: rc.cwd, commit, dest, audit: true });
+      validate(true);
+      if (!wt.ok) return { ok: false, blocked: 'worktree_failed', error: `审计工作树创建失败: ${wt.error}` };
+      const init = await executor.worktreeStatus(dest, { audit: true });
+      validate(true);
+      if (!init.clean) return { ok: false, blocked: 'dirty_worktree', error: '审计工作树初始不干净' };
+      checkHead('before');
 
-    const wt = await executor.createWorktree({ repo: rc.cwd, commit, dest, audit:true });
-    validate(true);
-    if (!wt.ok) {
-      finalizeAttempt(task, execId, { status: 'failed', reason: `审计工作树创建失败: ${wt.error}` });
-      return { ok: false, blocked: 'worktree_failed', error: wt.error };
-    }
-    const init = await executor.worktreeStatus(dest,{audit:true});
-    validate(true);
-    if (!init.clean) {
-      finalizeAttempt(task, execId, { status: 'failed', reason: '审计工作树初始不干净' });
-      return { ok: false, blocked: 'dirty_worktree', error: '审计工作树初始不干净' };
-    }
-
-    const proxyUrl = await isolation.egressProxyUrl();
-    validate(true);
-    const cred = writeCredentialFile(execId, proxyUrl, modelToken);
-    if (!cred.ok) {
-      finalizeAttempt(task, execId, { status: 'failed', reason: cred.error });
-      return { ok: false, blocked: 'credentials_unavailable', error: cred.error };
-    }
-    credFile = cred.file;
-
-    const prompt = [
-      '你是独立审计员。只读审计，禁止修改任何文件。',
-      '',
-      '## 被审计版本',
-      `固定 commit: ${wt.sha}`,
-      '',
-      '## 固定审计依据',
-      contract,
-      '',
-      '## 要求',
-      '逐条核对契约，给出 PASS / FAIL / 无法判定，并给出证据（文件与行号）。',
-      '不要臆造未看到的代码。'
-    ].join('\n');
-
-    const auditTmp = join(JARVIS_HOME, 'audit-tmp', execId);
-    mkdirSync(auditTmp, { recursive: true });
-    const res = await launchContainer({
-      executionId: execId,
-      taskId: task.id,
-      kind: 'audit',
-      name: `jarvis-audit-${execId}`,
-      run: (resourceId) => isolation.runClaudeIsolated({
+      const proxyUrl = await isolation.egressProxyUrl();
+      validate(true);
+      checkHead('before');
+      const cred = writeCredentialFile(execId, proxyUrl, modelToken);
+      if (!cred.ok) return { ok: false, blocked: 'credentials_unavailable', error: cred.error };
+      credFile = cred.file;
+      const prompt = [
+        '你是独立审计员。只读审计，禁止修改任何文件。',
+        '', '## 被审计版本', `固定 commit: ${head.expected}`,
+        '', '## 固定审计依据', contract,
+        '', '## 要求',
+        '逐条核对契约，给出 PASS / FAIL / 无法判定，并给出证据（文件与行号）。',
+        '不要臆造未看到的代码。'
+      ].join('\n');
+      const auditTmp = join(JARVIS_HOME, 'audit-tmp', execId);
+      mkdirSync(auditTmp, { recursive: true });
+      const res = await launchContainer({
+        executionId: execId,
+        taskId: task.id,
+        kind: 'audit',
         name: `jarvis-audit-${execId}`,
-        workdir: dest,
-        prompt,
-        mode: 'plan',
-        image: st.image,
-        credentialsFile: credFile,
-        modelToken,
-        readOnly: true,
-        tmpDir: auditTmp,
-        proxyUrl,
-        guard: () => { try { validate(true); } catch { return false; } return claimDockerInvocation(resourceId, task.id); },
-        onStarted: () => markContainerRunning(resourceId)
-      })
-    });
-    if (res.cancelled) {
-      finalizeAttempt(task, execId, { status: 'cancelled', reason: '取消于 Audit 启动前' });
-      return { ok: false, blocked: 'cancelled', error: '任务已取消，Audit 容器未启动' };
-    }
-
-    validate(true);
-    const after = await executor.worktreeStatus(dest,{audit:true});
-    validate(true);
-    const evidence = {
-      isolated: true,
-      network: st.network,
-      image: st.image,
-      audit: {
-        repo: rc.cwd,
-        commit: wt.sha,
-        contract_sha256: sha256(contract),
-        worktreeClean: after.clean,
-        dirty: after.raw.slice(0, 300)
+        run: (resourceId) => isolation.runClaudeIsolated({
+          name: `jarvis-audit-${execId}`,
+          workdir: dest,
+          prompt,
+          mode: 'plan',
+          image: st.image,
+          credentialsFile: credFile,
+          modelToken,
+          readOnly: true,
+          tmpDir: auditTmp,
+          proxyUrl,
+          guard: () => {
+            try {
+              validate(true);
+              checkHead('guard');
+            } catch {
+              return false;
+            }
+            return claimDockerInvocation(resourceId, task.id);
+          },
+          onStarted: () => markContainerRunning(resourceId)
+        })
+      });
+      if (res.cancelled && head.guard?.error) {
+        return { ...res, ok: false, cancelled: false, blocked: 'audit_head', error: head.guard.error };
       }
-    };
-
-    const ok = res.ok && after.clean;
-    const reason = res.ok ? (after.clean ? '' : '审计过程修改了被审计代码') : (res.error ?? '执行失败');
-    finalizeAttempt(task, execId, { status: ok ? 'ok' : 'failed', reason, evidence, text: res.text });
-
-    return { ...res, ok, evidence, task: getTask(task.id), execution: execId };
-  } catch(e) {
-    finalizeAttempt(task,execId,{status:getTask(task.id).status==='cancelled'?'cancelled':'failed',reason:e.message});
-    return {ok:false,blocked:'audit_scope',error:e.message};
+      if (res.cancelled) {
+        return { ...res, ok: false, blocked: 'cancelled', error: res.error ?? '任务已取消，Audit 容器未启动' };
+      }
+      validate(true);
+      checkHead('after');
+      const after = await executor.worktreeStatus(dest, { audit: true });
+      validate(true);
+      checkHead('after');
+      evidence.audit.worktreeClean = after.clean;
+      evidence.audit.dirty = after.raw.slice(0, 300);
+      return {
+        ...res,
+        ok: Boolean(res.ok && after.clean),
+        error: res.ok ? (after.clean ? '' : '审计过程修改了被审计代码') : (res.error ?? '执行失败')
+      };
+    })();
+    completion = result.ok ? 'ok' : result.cancelled ? 'cancelled' : 'failed';
+    reason = result.error ?? '';
+  } catch (error) {
+    const cancelled = ['cancelled', 'cancel_requested', 'cancel_failed'].includes(getTask(task.id).status);
+    completion = cancelled ? 'cancelled' : 'failed';
+    reason = error.message;
+    result = { ok: false, blocked: 'audit_scope', error: reason };
   } finally {
     revokeModelToken(modelToken);
     try { if (credFile) rmSync(credFile, { force: true }); } catch {}
-    if (!preserved) {
-      try { await executor.removeWorktree({ repo: rc.cwd, dest, audit:true }); } catch {}
+    const cleanup = { repo: rc.cwd, path: dest, pending: false, error: '' };
+    if (worktreeAttempted) {
+      try {
+        const removed = await executor.removeWorktree({ repo: rc.cwd, dest, audit: true });
+        if (!removed?.ok || existsSync(dest)) {
+          throw new Error(removed?.out || '工作树清理未确认完成');
+        }
+      } catch (error) {
+        cleanup.pending = true;
+        cleanup.error = error.message;
+      }
+    }
+    evidence.cleanup = cleanup;
+  }
+  // Cleanup is an await boundary too; cancellation or scope drift cannot turn
+  // an earlier runner success into a successful completion afterwards.
+  if (result.ok) {
+    try {
+      validate(true);
+    } catch (error) {
+      const cancelled = ['cancelled', 'cancel_requested', 'cancel_failed'].includes(getTask(task.id).status);
+      completion = cancelled ? 'cancelled' : 'failed';
+      reason = error.message;
+      result = { ...result, ok: false, blocked: 'audit_scope', error: reason };
     }
   }
+  if (evidence.cleanup.pending) {
+    evidence.cleanup.original_reason = reason;
+    reason = [reason, `审计工作树清理失败: ${evidence.cleanup.error}`].filter(Boolean).join('; ');
+    const cancelled = completion === 'cancelled' || ['cancelled', 'cancel_requested', 'cancel_failed'].includes(getTask(task.id).status);
+    completion = cancelled ? 'cancel_failed' : 'failed';
+    result = { ...result, ok: false, blocked: 'cleanup_failed', error: reason };
+  }
+  // Finalize once, after cleanup, so success can never hide a remaining worktree.
+  finalizeAttempt(task, execId, { status: completion, reason, evidence, text: result.text });
+  if (completion === 'cancel_failed') {
+    db().prepare("UPDATE tasks SET status='cancel_failed', error=?, updated_at=? WHERE id=?").run(reason, now(), task.id);
+    db().prepare('UPDATE executions SET status=?, error=?, evidence=? WHERE id=?')
+      .run(completion, reason, JSON.stringify(evidence), execId);
+  }
+  return { ...result, evidence, task: getTask(task.id), execution: execId };
 }
 
 /* ----------------------------- Verify Profiles ------------------------------- */
