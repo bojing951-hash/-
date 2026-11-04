@@ -35,6 +35,7 @@ test('MCP executor fixed inputs persist through production routes without relaxi
  const before=Object.fromEntries(modulePaths.map(p=>[p,hash(p)]));save(join(out,'source-before.json'),before);save(join(out,'invocation.json'),{test:process.argv,source,env,node:process.execPath,version:process.version,targets,testSha256:hash(fileURLToPath(import.meta.url))});
  const rawRequests=join(out,'requests.jsonl'),rawResponses=join(out,'responses.jsonl');writeFileSync(rawRequests,'');writeFileSync(rawResponses,'');writeFileSync(join(out,'server.stderr'),'');
  let pending=null,seq=0,buffer='',protocolError=null,closed=null;
+ const ac08InitialTestSha256=hash(fileURLToPath(import.meta.url));
  const child=spawn(process.execPath,[join(source,'orchestrator/src/mcp.mjs')],{cwd:out,env,detached:true,stdio:['pipe','pipe','pipe']});
  save(join(out,'server-start.json'),{argv:[process.execPath,join(source,'orchestrator/src/mcp.mjs')],pid:child.pid});
  const closePromise=new Promise(resolveClose=>{child.on('close',(code,signal)=>{closed={code,signal};if(pending){pending.reject(new Error(`server exited ${code}/${signal}`));pending=null;}resolveClose(closed);});child.on('error',e=>{protocolError=e;if(pending){pending.reject(e);pending=null;}});});
@@ -45,6 +46,7 @@ test('MCP executor fixed inputs persist through production routes without relaxi
  const snapshots=[];
  const ac05={A:null,B:null,C:null,D:null};
  let ac05NormalEof=false,ac05ForcedCleanup=false,ac05GroupAbsent=false,ac05SourcesUnchanged=false;
+ const ac08={cliTask:null,mcpWorkflow:null,cliWorkflow:null};const ac08CliStates=[];
  function rows(label){const db=new DatabaseSync(dbPath,{readOnly:true});try{const data=Object.fromEntries(['projects','tasks','executions','workflows','execution_resources','approvals','auth_nonces','settings','events'].map(n=>[n,db.prepare(`SELECT * FROM ${n} ORDER BY rowid`).all()]));save(join(out,`${label}.sqlite.json`),data);snapshots.push(label);return data;}finally{db.close();}}
  async function rpc(method,params={}){noExternal();assert(!pending&&!closed&&!protocolError);const request={jsonrpc:'2.0',id:++seq,method,params};appendFileSync(rawRequests,JSON.stringify(request)+'\n');const response=await timeout(new Promise((resolve,reject)=>{pending={id:request.id,resolve,reject};child.stdin.write(JSON.stringify(request)+'\n',e=>{if(e&&pending){pending.reject(e);pending=null;}});}),5000,method);assert.equal(response.id,request.id);assert.equal(response.jsonrpc,'2.0');assert(!response.error);noExternal();return response.result;}
  const tool=(name,args)=>rpc('tools/call',{name,arguments:args});
@@ -126,6 +128,86 @@ test('MCP executor fixed inputs persist through production routes without relaxi
    const result=value(await tool('workflow_run',{workflow:wf.id}));assert.equal(result.ok,false);assert.equal(result.blocked,'stage_failed');assert.equal(result.workflow,'failed');
    const data=rows(`05-workflow-${field}`);const tasks=data.tasks.filter(x=>x.workflow_id===wf.id);assert.equal(tasks.length,1);assert.deepEqual(JSON.parse(tasks[0].executor_config),cfg);refusal(data,tasks[0].id,'validate','invalid_executor_config');assert.match(data.executions.find(e=>e.task_id===tasks[0].id).error,new RegExp(`不允许的执行器字段: ${field}`));noSideEffects(data);
   });
+  await t.test('AC08 CLI task run rejects the fixed unauthorized write at authorize',async()=>{
+   const created=value(await tool('task_create',{...args,title:'AC08 CLI task'}));
+   const cliArgs=[join(source,'orchestrator/src/cli.mjs'),'task','run','--task',created.id,'--json'];
+   const cliState={pid:null,pgid:null,closed:false,code:null,signal:null,spawnError:false,timedOut:false,overflow:false,forced:false,unknown:false,groupAbsent:false};
+   let cli=null,cliDone,cliOutput='',cliErrorBytes=0;
+   const cliGroup=()=>{if(!Number.isSafeInteger(cliState.pgid)||cliState.pgid<=1){cliState.unknown=true;return 'UNKNOWN';}try{process.kill(-cliState.pgid,0);return 'PRESENT';}catch(e){if(e.code==='ESRCH')return 'ABSENT';cliState.unknown=true;return 'UNKNOWN';}};
+   const cliSignal=signal=>{if(cliGroup()==='PRESENT'){try{process.kill(-cliState.pgid,signal);}catch(e){if(e.code!=='ESRCH')cliState.unknown=true;}}};
+   try{
+    cli=spawn(process.execPath,cliArgs,{cwd:source,env,detached:true,stdio:['ignore','pipe','pipe']});
+    cliState.pid=cli.pid;cliState.pgid=cli.pid;ac08CliStates.push(cliState);
+    cliDone=new Promise(resolveClose=>{cli.once('error',()=>{cliState.spawnError=true;});cli.once('close',(code,signal)=>{cliState.closed=true;cliState.code=code;cliState.signal=signal;resolveClose();});});
+    cli.stdout.setEncoding('utf8');cli.stdout.on('data',chunk=>{if(Buffer.byteLength(cliOutput)+Buffer.byteLength(chunk)<=65536)cliOutput+=chunk;else cliState.overflow=true;});
+    cli.stderr.on('data',chunk=>{cliErrorBytes+=chunk.length;if(cliErrorBytes>65536)cliState.overflow=true;});
+    assert(Number.isSafeInteger(cli.pid)&&cli.pid>1&&cli.pid!==process.pid,'AC08_KNOWN_CLI_PID');
+    try{await timeout(cliDone,15000,'AC08 CLI normal wait');}catch{cliState.timedOut=true;}
+   }finally{
+    if(cli&&(!cliState.closed||cliGroup()==='PRESENT')){
+     cliState.forced=true;cliSignal('SIGTERM');const termEnd=process.hrtime.bigint()+1000000000n;
+     while(process.hrtime.bigint()<termEnd&&(!cliState.closed||cliGroup()==='PRESENT'))await sleep(20);
+     if(!cliState.closed||cliGroup()==='PRESENT')cliSignal('SIGKILL');const killEnd=process.hrtime.bigint()+4000000000n;
+     while(process.hrtime.bigint()<killEnd&&(!cliState.closed||cliGroup()==='PRESENT'))await sleep(20);
+    }
+    cliState.groupAbsent=cliGroup()==='ABSENT';if(!cliState.closed||!cliState.groupAbsent)cliState.unknown=true;
+    if(cli&&!cliState.closed){cli.stdout.destroy();cli.stderr.destroy();cli.unref();}
+   }
+   assert(cliState.closed&&!cliState.spawnError&&!cliState.timedOut&&!cliState.overflow&&!cliState.forced&&!cliState.unknown&&cliState.groupAbsent,'AC08_CLI_NORMAL_REAP_REQUIRED');
+   assert.equal(cliState.code,2,'AC08_CLI_EXPECTED_EXIT');assert.equal(cliState.signal,null,'AC08_CLI_SIGNAL_NULL');
+   const cliResult=JSON.parse(cliOutput);
+   assert.equal(cliResult.ok,false);assert.equal(cliResult.blocked,'needs_approval');
+   const data=rows('ac08-cli-task');const stored=data.tasks.find(x=>x.id===created.id);const cfg=JSON.parse(stored.executor_config);
+   assert.equal(stored.kind,'executor');assert.equal(stored.executor,'claude-code');assert.deepEqual(cfg,{cwd:project.dir,repo,base_commit:head,mode:'acceptEdits'});
+   const e=refusal(data,created.id,'authorize','needs_approval');assert.equal(e.plan.mode,'acceptEdits');assert.equal(e.plan.repo,repo);assert.equal(e.plan.baseCommit,head);assert.equal(e.plan.cwd,project.dir);noSideEffects(data);
+   ac08.cliTask={fixedOperation:true,phase:e.phase,blocked:e.blocked,rejectionCount:data.executions.filter(x=>x.task_id===created.id).length,normalCli:true};
+  });
+  await t.test('AC08 MCP workflow with valid config rejects the same unauthorized write',async()=>{
+   const cfg={cwd:project.dir,repo,base_commit:head,mode:'acceptEdits'};
+   const wfSpec={stages:[{name:'AC08 MCP',nodes:[{title:'fixed write',executor:'claude-code',executorConfig:cfg}]}]};
+   const wf=value(await tool('workflow_create',{project:project.id,name:'AC08 MCP workflow',spec:wfSpec}));assert.deepEqual(JSON.parse(wf.spec),wfSpec);
+   const result=value(await tool('workflow_run',{workflow:wf.id}));assert.equal(result.ok,false);assert.equal(result.blocked,'stage_failed');assert.equal(result.workflow,'failed');
+   const data=rows('ac08-mcp-workflow');const tasks=data.tasks.filter(x=>x.workflow_id===wf.id);assert.equal(tasks.length,1);const created=tasks[0];
+   assert.equal(created.kind,'executor');assert.equal(created.executor,'claude-code');assert.deepEqual(JSON.parse(created.executor_config),cfg);assert.equal(result.results.length,1);assert.equal(result.results[0].task,created.id);assert.equal(result.results[0].ok,false);
+   const e=refusal(data,created.id,'authorize','needs_approval');assert.equal(e.plan.mode,'acceptEdits');assert.equal(e.plan.repo,repo);assert.equal(e.plan.baseCommit,head);assert.equal(e.plan.cwd,project.dir);noSideEffects(data);
+   ac08.mcpWorkflow={fixedOperation:true,phase:e.phase,blocked:e.blocked,rejectionCount:data.executions.filter(x=>x.task_id===created.id).length,singleExecutorTask:tasks.length===1,stageFailed:result.blocked==='stage_failed'};
+  });
+  await t.test('AC08 CLI workflow with valid config rejects the same unauthorized write',async()=>{
+   const cfg={cwd:project.dir,repo,base_commit:head,mode:'acceptEdits'};
+   const wfSpec={stages:[{name:'AC08 CLI',nodes:[{title:'fixed write',executor:'claude-code',executorConfig:cfg}]}]};
+   const wf=value(await tool('workflow_create',{project:project.id,name:'AC08 CLI workflow',spec:wfSpec}));assert.deepEqual(JSON.parse(wf.spec),wfSpec);
+   const cliArgs=[join(source,'orchestrator/src/cli.mjs'),'workflow','run','--workflow',wf.id,'--json'];
+   const cliState={pid:null,pgid:null,closed:false,code:null,signal:null,spawnError:false,timedOut:false,overflow:false,forced:false,unknown:false,groupAbsent:false};
+   let cli=null,cliDone,cliOutput='',cliErrorBytes=0;
+   const cliGroup=()=>{if(!Number.isSafeInteger(cliState.pgid)||cliState.pgid<=1){cliState.unknown=true;return 'UNKNOWN';}try{process.kill(-cliState.pgid,0);return 'PRESENT';}catch(e){if(e.code==='ESRCH')return 'ABSENT';cliState.unknown=true;return 'UNKNOWN';}};
+   const cliSignal=signal=>{if(cliGroup()==='PRESENT'){try{process.kill(-cliState.pgid,signal);}catch(e){if(e.code!=='ESRCH')cliState.unknown=true;}}};
+   try{
+    cli=spawn(process.execPath,cliArgs,{cwd:source,env,detached:true,stdio:['ignore','pipe','pipe']});
+    cliState.pid=cli.pid;cliState.pgid=cli.pid;ac08CliStates.push(cliState);
+    cliDone=new Promise(resolveClose=>{cli.once('error',()=>{cliState.spawnError=true;});cli.once('close',(code,signal)=>{cliState.closed=true;cliState.code=code;cliState.signal=signal;resolveClose();});});
+    cli.stdout.setEncoding('utf8');cli.stdout.on('data',chunk=>{if(Buffer.byteLength(cliOutput)+Buffer.byteLength(chunk)<=65536)cliOutput+=chunk;else cliState.overflow=true;});
+    cli.stderr.on('data',chunk=>{cliErrorBytes+=chunk.length;if(cliErrorBytes>65536)cliState.overflow=true;});
+    assert(Number.isSafeInteger(cli.pid)&&cli.pid>1&&cli.pid!==process.pid,'AC08_KNOWN_CLI_PID');
+    try{await timeout(cliDone,15000,'AC08 CLI normal wait');}catch{cliState.timedOut=true;}
+   }finally{
+    if(cli&&(!cliState.closed||cliGroup()==='PRESENT')){
+     cliState.forced=true;cliSignal('SIGTERM');const termEnd=process.hrtime.bigint()+1000000000n;
+     while(process.hrtime.bigint()<termEnd&&(!cliState.closed||cliGroup()==='PRESENT'))await sleep(20);
+     if(!cliState.closed||cliGroup()==='PRESENT')cliSignal('SIGKILL');const killEnd=process.hrtime.bigint()+4000000000n;
+     while(process.hrtime.bigint()<killEnd&&(!cliState.closed||cliGroup()==='PRESENT'))await sleep(20);
+    }
+    cliState.groupAbsent=cliGroup()==='ABSENT';if(!cliState.closed||!cliState.groupAbsent)cliState.unknown=true;
+    if(cli&&!cliState.closed){cli.stdout.destroy();cli.stderr.destroy();cli.unref();}
+   }
+   assert(cliState.closed&&!cliState.spawnError&&!cliState.timedOut&&!cliState.overflow&&!cliState.forced&&!cliState.unknown&&cliState.groupAbsent,'AC08_CLI_NORMAL_REAP_REQUIRED');
+   assert.equal(cliState.code,2,'AC08_CLI_EXPECTED_EXIT');assert.equal(cliState.signal,null,'AC08_CLI_SIGNAL_NULL');
+   const cliResult=JSON.parse(cliOutput);
+   assert.equal(cliResult.ok,false);assert.equal(cliResult.blocked,'stage_failed');assert.equal(cliResult.workflow.status,'failed');
+   const data=rows('ac08-cli-workflow');const tasks=data.tasks.filter(x=>x.workflow_id===wf.id);assert.equal(tasks.length,1);const created=tasks[0];
+   assert.equal(created.kind,'executor');assert.equal(created.executor,'claude-code');assert.deepEqual(JSON.parse(created.executor_config),cfg);assert.equal(cliResult.results.length,1);assert.equal(cliResult.results[0].task,created.id);assert.equal(cliResult.results[0].ok,false);
+   const e=refusal(data,created.id,'authorize','needs_approval');assert.equal(e.plan.mode,'acceptEdits');assert.equal(e.plan.repo,repo);assert.equal(e.plan.baseCommit,head);assert.equal(e.plan.cwd,project.dir);noSideEffects(data);
+   ac08.cliWorkflow={fixedOperation:true,phase:e.phase,blocked:e.blocked,rejectionCount:data.executions.filter(x=>x.task_id===created.id).length,singleExecutorTask:tasks.length===1,stageFailed:cliResult.blocked==='stage_failed',normalCli:true};
+  });
   noSideEffects(rows('final'));child.stdin.end();await timeout(closePromise,5000,'server EOF');assert.equal(closed.code,0);assert.equal(closed.signal,null);assert.equal(buffer.trim(),'');assert(!protocolError);
   assert(Number.isSafeInteger(child.pid)&&child.pid>1,'AC05_KNOWN_CHILD_ID');assert(ac05.A&&ac05.B&&ac05.C&&ac05.D,'AC05_ALL_SUBTEST_FACTS_REQUIRED');ac05NormalEof=true;
  }finally{
@@ -148,4 +230,19 @@ test('MCP executor fixed inputs persist through production routes without relaxi
  const ac05Record={kind:'AC05_NEGATIVE_MCP',cases:['A','B','C','D'],allRejected:rejectedCases.every(x=>x.blocked==='needs_approval')&&ac05.D.unknownToolRejected,modelFieldDiscarded:ac05.B.modelFieldDiscarded,claimTextSubmitted:ac05.C.claimTextSubmitted,unknownToolRejected:ac05.D.unknownToolRejected,unknownToolTablesUnchanged:ac05.D.tablesUnchanged,rejectionPhasesMatch:rejectedCases.every(x=>x.phase==='authorize'),eachRejectedExecutionOnce:rejectedCases.every(x=>x.count===1),approvalRows:ac05Final.approvals.length,nonceRows:ac05Final.auth_nonces.length,resourceRows:ac05Final.execution_resources.length,externalCalls,markerCreated,producerExit:closed.code,producerSignalNull:closed.signal===null,processGroupAbsent:ac05GroupAbsent,sourceHashesUnchanged:ac05SourcesUnchanged};
  for(const name of ['allRejected','modelFieldDiscarded','claimTextSubmitted','unknownToolRejected','unknownToolTablesUnchanged','rejectionPhasesMatch','eachRejectedExecutionOnce','producerSignalNull','processGroupAbsent','sourceHashesUnchanged'])assert.equal(ac05Record[name],true,'AC05_SUCCESS_FACT_REQUIRED');
  console.log('AC05_NEGATIVE_MCP '+JSON.stringify(ac05Record));
+ assert(ac08.cliTask&&ac08.mcpWorkflow&&ac08.cliWorkflow,'AC08_ALL_CASE_FACTS_REQUIRED');
+ assert(ac05NormalEof&&!ac05ForcedCleanup&&ac05GroupAbsent&&ac05SourcesUnchanged,'AC08_NORMAL_PRODUCER_REQUIRED');assert.equal(closed.code,0);assert.equal(closed.signal,null);assert.equal(buffer.trim(),'');assert(!protocolError);
+ assert.equal(ac08CliStates.length,2,'AC08_CLI_COUNT');
+ const ac08CliGroupAbsence=[];
+ for(const state of ac08CliStates){
+  assert(state.closed&&state.code===2&&state.signal===null&&!state.spawnError&&!state.timedOut&&!state.overflow&&!state.forced&&!state.unknown&&state.groupAbsent,'AC08_ALL_CLI_NORMAL');assert(Number.isSafeInteger(state.pid)&&state.pid>1&&state.pgid===state.pid,'AC08_BOUND_CLI_GROUP');
+  let absent=false;try{process.kill(-state.pgid,0);}catch(e){absent=e.code==='ESRCH';}assert(absent,'AC08_CLI_GROUP_REMAINS');ac08CliGroupAbsence.push(absent);
+ }
+ let ac08McpAbsent=false;try{process.kill(-child.pid,0);}catch(e){ac08McpAbsent=e.code==='ESRCH';}assert(ac08McpAbsent,'AC08_MCP_GROUP_REMAINS');
+ const ac08FinalSources=Object.fromEntries(modulePaths.map(p=>[p,hash(p)]));assert.deepEqual(ac08FinalSources,before);assert.equal(hash(fileURLToPath(import.meta.url)),ac08InitialTestSha256);noExternal();
+ const ac08Final=rows('ac08-closed-final');noSideEffects(ac08Final);const ac08ExternalCalls=readFileSync(sentinel,'utf8').split('\n').filter(Boolean).length;const ac08MarkerCreated=existsSync(marker);assert.equal(ac08ExternalCalls,0);assert.equal(ac08MarkerCreated,false);
+ const ac08Cases=[ac08.cliTask,ac08.mcpWorkflow,ac08.cliWorkflow];
+ const ac08Record={kind:'AC08_ENTRANCE_REFUSAL',cases:['CLI_TASK','MCP_WORKFLOW','CLI_WORKFLOW'],allCaseFactsRecorded:ac08Cases.length===3&&ac08Cases.every(Boolean),allAuthorizeNeedsApproval:ac08Cases.every(x=>x.phase==='authorize'&&x.blocked==='needs_approval'),sameFixedOperation:ac08Cases.every(x=>x.fixedOperation),uniqueRejectedExecutionPerCase:ac08Cases.every(x=>x.rejectionCount===1),workflowSingleExecutorTask:ac08.mcpWorkflow.singleExecutorTask&&ac08.cliWorkflow.singleExecutorTask,workflowStageFailed:ac08.mcpWorkflow.stageFailed&&ac08.cliWorkflow.stageFailed,cliCalls:ac08CliStates.length,cliNormalExit2:ac08CliStates.every(x=>x.closed&&x.code===2&&x.signal===null),noForcedCliCleanup:ac08CliStates.every(x=>!x.forced),allKnownCliGroupsAbsent:ac08CliGroupAbsence.length===2&&ac08CliGroupAbsence.every(Boolean),mcpGroupAbsent:ac08McpAbsent,producerExit:closed.code,producerSignalNull:closed.signal===null,noProtocolError:!protocolError&&buffer.trim()==='',sourceHashesUnchanged:JSON.stringify(ac08FinalSources)===JSON.stringify(before),testSourceSha256:ac08InitialTestSha256,sourceManifestSha256:createHash('sha256').update(JSON.stringify(ac08FinalSources)).digest('hex'),approvalRows:ac08Final.approvals.length,nonceRows:ac08Final.auth_nonces.length,resourceRows:ac08Final.execution_resources.length,externalCalls:ac08ExternalCalls,markerCreated:ac08MarkerCreated};
+ for(const name of ['allCaseFactsRecorded','allAuthorizeNeedsApproval','sameFixedOperation','uniqueRejectedExecutionPerCase','workflowSingleExecutorTask','workflowStageFailed','cliNormalExit2','noForcedCliCleanup','allKnownCliGroupsAbsent','mcpGroupAbsent','producerSignalNull','noProtocolError','sourceHashesUnchanged'])assert.equal(ac08Record[name],true,'AC08_SUCCESS_FACT_REQUIRED');
+ console.log('AC08_ENTRANCE_REFUSAL '+JSON.stringify(ac08Record));
 });
