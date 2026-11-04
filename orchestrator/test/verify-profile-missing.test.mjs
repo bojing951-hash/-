@@ -82,6 +82,7 @@ test('AC04B normal service rejects missing verification profile before external 
   const g=group();record.groupAbsent=g==='ABSENT';if(!closed||g!=='ABSENT')unknown=true;
   if(child&&!closed){child.stdout.destroy();child.stderr.destroy();child.unref();}
   try{
+   assert.ok(closed&&record.groupAbsent===true&&!unknown,'TRIPWIRE_PRODUCER_EXIT_UNCONFIRMED');
    const log=path.join(root,'tripwire.log');if(fs.existsSync(log))assert.ok(fs.statSync(log).size<65536);const raw=fs.existsSync(log)?fs.readFileSync(log):Buffer.alloc(0);record.tripwireCount=raw.length?raw.toString('utf8').split('\n').filter(Boolean).length:0;record.tripwireLogSha256=hash(raw);
    assert.ok(closed&&!spawnError&&!overflow&&!timedOut&&!unknown&&code===0&&signal===null);
    const report=JSON.parse(stdout);assert.equal(stdout,JSON.stringify(report)+'\n');
