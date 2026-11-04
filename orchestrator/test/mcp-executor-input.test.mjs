@@ -11,7 +11,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve, join, isAbsolute } from 'node:path';
 import { tmpdir } from 'node:os';
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync, mkdtempSync, existsSync, readdirSync, symlinkSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, mkdtempSync, existsSync, readdirSync, symlinkSync, realpathSync } from 'node:fs';
 const source=process.env.MCP_INPUT_SOURCE || resolve(dirname(fileURLToPath(import.meta.url)),'../..');
 const evidence=process.env.MCP_INPUT_EVIDENCE;
 const hash=p=>createHash('sha256').update(readFileSync(p)).digest('hex');
@@ -36,6 +36,11 @@ test('MCP executor fixed inputs persist through production routes without relaxi
  const rawRequests=join(out,'requests.jsonl'),rawResponses=join(out,'responses.jsonl');writeFileSync(rawRequests,'');writeFileSync(rawResponses,'');writeFileSync(join(out,'server.stderr'),'');
  let pending=null,seq=0,buffer='',protocolError=null,closed=null;
  const ac08InitialTestSha256=hash(fileURLToPath(import.meta.url));
+ const ac0910={facts:[],baseline:null,legalAccepted:false,legalTaskId:null};let ac0910Snapshot=null;
+ // AC0910_SUBTEST_GATE_BEGIN
+ const ac0910Subtests={completed:0,allPassed:true};
+ t.afterEach(child=>{ac0910Subtests.completed++;ac0910Subtests.allPassed=ac0910Subtests.allPassed&&child.passed===true&&!child.error;});
+ // AC0910_SUBTEST_GATE_END
  const child=spawn(process.execPath,[join(source,'orchestrator/src/mcp.mjs')],{cwd:out,env,detached:true,stdio:['pipe','pipe','pipe']});
  save(join(out,'server-start.json'),{argv:[process.execPath,join(source,'orchestrator/src/mcp.mjs')],pid:child.pid});
  const closePromise=new Promise(resolveClose=>{child.on('close',(code,signal)=>{closed={code,signal};if(pending){pending.reject(new Error(`server exited ${code}/${signal}`));pending=null;}resolveClose(closed);});child.on('error',e=>{protocolError=e;if(pending){pending.reject(e);pending=null;}});});
@@ -55,7 +60,7 @@ test('MCP executor fixed inputs persist through production routes without relaxi
  function command(label,argv,cmdEnv=env){const p=spawnSync(argv[0],argv.slice(1),{cwd:source,env:cmdEnv,encoding:'utf8',timeout:15000});save(join(out,`${label}.command.json`),{argv,exitCode:p.status,signal:p.signal,error:p.error?.message});writeFileSync(join(out,`${label}.stdout`),p.stdout||'');writeFileSync(join(out,`${label}.stderr`),p.stderr||'');assert.equal(p.status,0,p.stderr||p.error?.message);noExternal();return p.stdout;}
  function plan(id,label){const code="import {pathToFileURL} from 'node:url';const svc=await import(pathToFileURL(process.argv[1]+'/orchestrator/src/service.mjs'));const task=svc.getTask(process.argv[2]);console.log(JSON.stringify(svc.resolveExecutorPlan(task,svc.getProject(task.project_id))));";return JSON.parse(command(label,[process.execPath,'--input-type=module','-e',code,source,id]));}
  function refusal(data,id,phase,blocked){const matches=data.executions.filter(e=>e.task_id===id);assert.equal(matches.length,1);assert.equal(matches[0].status,'rejected');const e=JSON.parse(matches[0].evidence);assert.equal(e.phase,phase);assert.equal(e.blocked,blocked);return e;}
- function noSideEffects(data){noExternal();assert.equal(data.execution_resources.length,0);assert.equal(data.approvals.length,0);assert.equal(data.auth_nonces.length,0);assert(!data.settings.some(x=>x.key==='notify_target'));assert(!data.events.some(x=>x.kind==='notify.sent'));for(const e of data.executions){assert.equal(e.status,'rejected');const v=JSON.parse(e.evidence);assert(['validate','authorize'].includes(v.phase));assert(['repo_outside_project','needs_approval','invalid_executor_config'].includes(v.blocked));}}
+ function noSideEffects(data){noExternal();assert.equal(data.execution_resources.length,0);assert.equal(data.approvals.length,0);assert.equal(data.auth_nonces.length,0);assert(!data.settings.some(x=>x.key==='notify_target'));assert(!data.events.some(x=>x.kind==='notify.sent'));for(const e of data.executions){assert.equal(e.status,'rejected');const v=JSON.parse(e.evidence);assert(['validate','authorize'].includes(v.phase));assert(['repo_outside_project','needs_approval','invalid_executor_config','path_outside_project'].includes(v.blocked));}}
  try{
   const init=await rpc('initialize',{protocolVersion:'2024-11-05'});assert.equal(init.serverInfo.name,'jarvis-control');
   const notification={jsonrpc:'2.0',method:'notifications/initialized'};appendFileSync(rawRequests,JSON.stringify(notification)+'\n');child.stdin.write(JSON.stringify(notification)+'\n');
@@ -208,6 +213,43 @@ test('MCP executor fixed inputs persist through production routes without relaxi
    const e=refusal(data,created.id,'authorize','needs_approval');assert.equal(e.plan.mode,'acceptEdits');assert.equal(e.plan.repo,repo);assert.equal(e.plan.baseCommit,head);assert.equal(e.plan.cwd,project.dir);noSideEffects(data);
    ac08.cliWorkflow={fixedOperation:true,phase:e.phase,blocked:e.blocked,rejectionCount:data.executions.filter(x=>x.task_id===created.id).length,singleExecutorTask:tasks.length===1,stageFailed:cliResult.blocked==='stage_failed',normalCli:true};
   });
+  // AC0910_BOUNDARY_CASES_BEGIN
+  const projectB=value(await tool('project_create',{name:'Boundary Project B',slug:'ac0910-project-b'}));assert.notEqual(projectB.id,project.id);assert.notEqual(projectB.dir,project.dir);
+  const repoB=join(projectB.dir,'repo');mkdirSync(repoB);writeFileSync(join(repoB,'fixture.txt'),'PROJECT_B_GIT_TARGET\n',{flag:'wx'});
+  const gitB=(label,argsB)=>command(label,['/usr/bin/git','-C',repoB,...argsB],gitEnv);
+  gitB('ac0910-b-init',['init','-q']);gitB('ac0910-b-add',['add','fixture.txt']);gitB('ac0910-b-commit',['-c','user.name=Fixture','-c','user.email=fixture@local.invalid','commit','-q','-m','boundary fixture']);
+  const headB=gitB('ac0910-b-head',['rev-parse','HEAD']).trim();assert.match(headB,/^[a-f0-9]{40}$/);
+  const bTarget=join(projectB.dir,'boundary-target');mkdirSync(bTarget);
+  const external=join(out,'ac0910-external');mkdirSync(external);
+  const targetFiles=[join(repo,'fixture.txt'),join(projectB.dir,'BOUNDARY_TARGET'),join(repoB,'fixture.txt'),join(bTarget,'BOUNDARY_TARGET'),join(external,'BOUNDARY_TARGET')];
+  for(const [file,text] of [[targetFiles[1],'PROJECT_B_ROOT\n'],[targetFiles[3],'PROJECT_B_LINK_TARGET\n'],[targetFiles[4],'EXTERNAL_TARGET\n']])writeFileSync(file,text,{flag:'wx'});
+  const boundaryLink=join(project.dir,'ac0910-link-to-b');symlinkSync(bTarget,boundaryLink);assert.equal(realpathSync(boundaryLink),realpathSync(bTarget));
+  ac0910Snapshot=label=>{
+   const data=rows(label);const aRow=data.projects.find(x=>x.id===project.id),bRow=data.projects.find(x=>x.id===projectB.id);assert(aRow&&bRow);
+   const linkReal=realpathSync(boundaryLink),targetReal=realpathSync(bTarget);assert.equal(linkReal,targetReal);
+   return {targetHashes:targetFiles.map(hash),headA:g(label+'-a-head',['rev-parse','HEAD']).trim(),headB:gitB(label+'-b-head',['rev-parse','HEAD']).trim(),linkReal,targetReal,projectA:aRow,projectB:bRow};
+  };
+  ac0910.baseline=ac0910Snapshot('ac0910-before');assert.equal(ac0910.baseline.headA,head);assert.equal(ac0910.baseline.headB,headB);
+  const legalDir=join(project.dir,'ac0910-legal');mkdirSync(legalDir);
+  const legal=value(await tool('task_create',{...args,title:'Boundary legal plan only',mode:'plan',cwd:legalDir}));const legalPlan=plan(legal.id,'ac0910-legal-plan');
+  assert.equal(legalPlan.ok,true);assert.equal(legalPlan.resolved.mode,'plan');assert.equal(legalPlan.resolved.cwd,realpathSync(legalDir));assert.equal(legalPlan.resolved.repo,realpathSync(repo));assert.equal(legalPlan.resolved.baseCommit,head);
+  const legalRows=rows('ac0910-legal-control');assert.equal(legalRows.executions.filter(x=>x.task_id===legal.id).length,0);noSideEffects(legalRows);ac0910.legalTaskId=legal.id;ac0910.legalAccepted=true;
+  const boundaryCases=[
+   {name:'CROSS_PROJECT_CWD',cwd:projectB.dir,repo,blocked:'path_outside_project'},
+   {name:'CROSS_PROJECT_GIT',cwd:project.dir,repo:repoB,blocked:'repo_outside_project'},
+   {name:'EXTERNAL_CWD',cwd:external,repo,blocked:'path_outside_project'},
+   {name:'CROSS_PROJECT_LINK',cwd:boundaryLink,repo,blocked:'path_outside_project'}
+  ];
+  for(const item of boundaryCases)await t.test('AC09/AC10 '+item.name+' is rejected by normal MCP before authorization',async()=>{
+   assert.deepEqual(ac0910Snapshot('ac0910-'+item.name+'-before'),ac0910.baseline);
+   const created=value(await tool('task_create',{...args,title:item.name,cwd:item.cwd,repo:item.repo}));const response=rejected(await tool('task_run',{task:created.id}));assert.equal(typeof response.error,'string');assert.match(response.error,/越界|不在项目/);
+   const data=rows('ac0910-'+item.name+'-rejected');const stored=data.tasks.find(x=>x.id===created.id);assert.equal(stored.project_id,project.id);assert.equal(stored.kind,'executor');assert.equal(stored.executor,'claude-code');
+   assert.deepEqual(JSON.parse(stored.executor_config),{cwd:item.cwd,repo:item.repo,base_commit:head,mode:'acceptEdits'});
+   const refusalEvidence=refusal(data,created.id,'validate',item.blocked);assert.equal(refusalEvidence.plan,null);noSideEffects(data);
+   assert.deepEqual(ac0910Snapshot('ac0910-'+item.name+'-after'),ac0910.baseline);
+   ac0910.facts.push({name:item.name,phase:refusalEvidence.phase,blocked:refusalEvidence.blocked,expectedBlocked:item.blocked,executionCount:data.executions.filter(x=>x.task_id===created.id).length,savedConfigMatched:true,targetsUnchanged:true});
+  });
+  // AC0910_BOUNDARY_CASES_END
   noSideEffects(rows('final'));child.stdin.end();await timeout(closePromise,5000,'server EOF');assert.equal(closed.code,0);assert.equal(closed.signal,null);assert.equal(buffer.trim(),'');assert(!protocolError);
   assert(Number.isSafeInteger(child.pid)&&child.pid>1,'AC05_KNOWN_CHILD_ID');assert(ac05.A&&ac05.B&&ac05.C&&ac05.D,'AC05_ALL_SUBTEST_FACTS_REQUIRED');ac05NormalEof=true;
  }finally{
@@ -245,4 +287,19 @@ test('MCP executor fixed inputs persist through production routes without relaxi
  const ac08Record={kind:'AC08_ENTRANCE_REFUSAL',cases:['CLI_TASK','MCP_WORKFLOW','CLI_WORKFLOW'],allCaseFactsRecorded:ac08Cases.length===3&&ac08Cases.every(Boolean),allAuthorizeNeedsApproval:ac08Cases.every(x=>x.phase==='authorize'&&x.blocked==='needs_approval'),sameFixedOperation:ac08Cases.every(x=>x.fixedOperation),uniqueRejectedExecutionPerCase:ac08Cases.every(x=>x.rejectionCount===1),workflowSingleExecutorTask:ac08.mcpWorkflow.singleExecutorTask&&ac08.cliWorkflow.singleExecutorTask,workflowStageFailed:ac08.mcpWorkflow.stageFailed&&ac08.cliWorkflow.stageFailed,cliCalls:ac08CliStates.length,cliNormalExit2:ac08CliStates.every(x=>x.closed&&x.code===2&&x.signal===null),noForcedCliCleanup:ac08CliStates.every(x=>!x.forced),allKnownCliGroupsAbsent:ac08CliGroupAbsence.length===2&&ac08CliGroupAbsence.every(Boolean),mcpGroupAbsent:ac08McpAbsent,producerExit:closed.code,producerSignalNull:closed.signal===null,noProtocolError:!protocolError&&buffer.trim()==='',sourceHashesUnchanged:JSON.stringify(ac08FinalSources)===JSON.stringify(before),testSourceSha256:ac08InitialTestSha256,sourceManifestSha256:createHash('sha256').update(JSON.stringify(ac08FinalSources)).digest('hex'),approvalRows:ac08Final.approvals.length,nonceRows:ac08Final.auth_nonces.length,resourceRows:ac08Final.execution_resources.length,externalCalls:ac08ExternalCalls,markerCreated:ac08MarkerCreated};
  for(const name of ['allCaseFactsRecorded','allAuthorizeNeedsApproval','sameFixedOperation','uniqueRejectedExecutionPerCase','workflowSingleExecutorTask','workflowStageFailed','cliNormalExit2','noForcedCliCleanup','allKnownCliGroupsAbsent','mcpGroupAbsent','producerSignalNull','noProtocolError','sourceHashesUnchanged'])assert.equal(ac08Record[name],true,'AC08_SUCCESS_FACT_REQUIRED');
  console.log('AC08_ENTRANCE_REFUSAL '+JSON.stringify(ac08Record));
+ // AC0910_FINAL_RECORD_BEGIN
+ assert.equal(ac0910Subtests.completed,20,'AC0910_ALL_SUBTESTS_COMPLETED');assert.equal(ac0910Subtests.allPassed,true,'AC0910_ALL_SUBTESTS_PASSED');
+ assert.equal(ac0910.facts.length,4,'AC0910_ALL_CASES_REQUIRED');assert.deepEqual(ac0910.facts.map(x=>x.name),['CROSS_PROJECT_CWD','CROSS_PROJECT_GIT','EXTERNAL_CWD','CROSS_PROJECT_LINK']);
+ assert(ac0910.legalAccepted&&ac0910.baseline&&ac0910Snapshot,'AC0910_SETUP_AND_CONTROL_REQUIRED');assert(ac05NormalEof&&!ac05ForcedCleanup&&ac05GroupAbsent&&ac05SourcesUnchanged,'AC0910_NORMAL_PRODUCER_REQUIRED');assert.equal(closed.code,0);assert.equal(closed.signal,null);assert.equal(buffer.trim(),'');assert(!protocolError);
+ assert.equal(ac08CliStates.length,2);const boundaryCliAbsent=[];
+ for(const state of ac08CliStates){assert(state.closed&&state.code===2&&state.signal===null&&!state.spawnError&&!state.timedOut&&!state.overflow&&!state.forced&&!state.unknown&&state.groupAbsent);assert(Number.isSafeInteger(state.pid)&&state.pid>1&&state.pgid===state.pid);let gone=false;try{process.kill(-state.pgid,0);}catch(e){gone=e.code==='ESRCH';}assert(gone,'AC0910_KNOWN_CLI_GROUP_REMAINS');boundaryCliAbsent.push(gone);}
+ let boundaryMcpAbsent=false;try{process.kill(-child.pid,0);}catch(e){boundaryMcpAbsent=e.code==='ESRCH';}assert(boundaryMcpAbsent,'AC0910_MCP_GROUP_REMAINS');
+ const boundaryFinal=ac0910Snapshot('ac0910-closed-final');assert.deepEqual(boundaryFinal,ac0910.baseline);
+ const boundarySources=Object.fromEntries(modulePaths.map(p=>[p,hash(p)]));assert.deepEqual(boundarySources,before);assert.equal(hash(fileURLToPath(import.meta.url)),ac08InitialTestSha256);
+ const boundaryRows=rows('ac0910-publish-final');noSideEffects(boundaryRows);const boundaryExternalCalls=readFileSync(sentinel,'utf8').split('\n').filter(Boolean).length;const boundaryMarkerCreated=existsSync(marker);assert.equal(boundaryExternalCalls,0);assert.equal(boundaryMarkerCreated,false);
+ const legalControlExecuted=boundaryRows.executions.some(x=>x.task_id===ac0910.legalTaskId);assert.equal(legalControlExecuted,false);
+ const boundaryRecord={kind:'AC09_AC10_BOUNDARY_REFUSAL',cases:ac0910.facts.map(x=>x.name),caseCount:ac0910.facts.length,allValidateRejected:ac0910.facts.every(x=>x.phase==='validate'),blockedClassificationsMatch:ac0910.facts.every(x=>x.blocked===x.expectedBlocked),uniqueRejectedExecutionPerCase:ac0910.facts.every(x=>x.executionCount===1),savedConfigsMatch:ac0910.facts.every(x=>x.savedConfigMatched),targetStateUnchangedPerCase:ac0910.facts.every(x=>x.targetsUnchanged),legalPlanControlAccepted:ac0910.legalAccepted,legalControlExecuted,targetHashesBefore:ac0910.baseline.targetHashes,targetHashesFinal:boundaryFinal.targetHashes,repoHeadsBefore:[ac0910.baseline.headA,ac0910.baseline.headB],repoHeadsFinal:[boundaryFinal.headA,boundaryFinal.headB],linkRealpathUnchanged:boundaryFinal.linkReal===ac0910.baseline.linkReal&&boundaryFinal.linkReal===boundaryFinal.targetReal,projectBindingsUnchanged:JSON.stringify([boundaryFinal.projectA,boundaryFinal.projectB])===JSON.stringify([ac0910.baseline.projectA,ac0910.baseline.projectB]),sourceHashesUnchanged:JSON.stringify(boundarySources)===JSON.stringify(before),testSourceSha256:ac08InitialTestSha256,approvalRows:boundaryRows.approvals.length,nonceRows:boundaryRows.auth_nonces.length,resourceRows:boundaryRows.execution_resources.length,externalCalls:boundaryExternalCalls,markerCreated:boundaryMarkerCreated,producerExit:closed.code,producerSignalNull:closed.signal===null,mcpGroupAbsent:boundaryMcpAbsent,knownCliGroupsAbsent:boundaryCliAbsent.length===2&&boundaryCliAbsent.every(Boolean),noForcedCleanup:!ac05ForcedCleanup&&ac08CliStates.every(x=>!x.forced)};
+ for(const name of ['allValidateRejected','blockedClassificationsMatch','uniqueRejectedExecutionPerCase','savedConfigsMatch','targetStateUnchangedPerCase','legalPlanControlAccepted','linkRealpathUnchanged','projectBindingsUnchanged','sourceHashesUnchanged','producerSignalNull','mcpGroupAbsent','knownCliGroupsAbsent','noForcedCleanup'])assert.equal(boundaryRecord[name],true,'AC0910_SUCCESS_FACT_REQUIRED');
+ console.log('AC09_AC10_BOUNDARY_REFUSAL '+JSON.stringify(boundaryRecord));
+ // AC0910_FINAL_RECORD_END
 });
