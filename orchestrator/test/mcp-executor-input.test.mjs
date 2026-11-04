@@ -9,9 +9,9 @@ import { spawn, spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { dirname, resolve, join, isAbsolute } from 'node:path';
+import { dirname, resolve, join, isAbsolute, basename } from 'node:path';
 import { tmpdir } from 'node:os';
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync, mkdtempSync, existsSync, readdirSync, symlinkSync, realpathSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, mkdtempSync, existsSync, readdirSync, symlinkSync, realpathSync, lstatSync } from 'node:fs';
 const source=process.env.MCP_INPUT_SOURCE || resolve(dirname(fileURLToPath(import.meta.url)),'../..');
 const evidence=process.env.MCP_INPUT_EVIDENCE;
 const hash=p=>createHash('sha256').update(readFileSync(p)).digest('hex');
@@ -37,6 +37,7 @@ test('MCP executor fixed inputs persist through production routes without relaxi
  let pending=null,seq=0,buffer='',protocolError=null,closed=null;
  const ac08InitialTestSha256=hash(fileURLToPath(import.meta.url));
  const ac0910={facts:[],baseline:null,legalAccepted:false,legalTaskId:null};let ac0910Snapshot=null;
+ const ac10Legacy={traversal:null,external:null};let ac10TraversalSnapshot=null,ac10ExternalSnapshot=null;
  // AC0910_SUBTEST_GATE_BEGIN
  const ac0910Subtests={completed:0,allPassed:true};
  t.afterEach(child=>{ac0910Subtests.completed++;ac0910Subtests.allPassed=ac0910Subtests.allPassed&&child.passed===true&&!child.error;});
@@ -114,11 +115,35 @@ test('MCP executor fixed inputs persist through production routes without relaxi
    noSideEffects(afterCall);
    ac05.D={unknownToolRejected:response.isError===true&&response.content[0].text==='未知工具: task_approve',tablesUnchanged:true};
   });
+  ac10TraversalSnapshot=()=>{
+   const lexical=resolve(project.dir,'../outside');assert.equal(dirname(lexical),dirname(project.dir));assert.equal(basename(lexical),'outside');
+   const parentCanonical=realpathSync(dirname(lexical)),projectCanonical=realpathSync(project.dir),canonical=join(parentCanonical,basename(lexical));
+   assert(canonical!==projectCanonical&&!canonical.startsWith(projectCanonical+'/'),'AC10_TRAVERSAL_CANONICAL_OUTSIDE');
+   assert.throws(()=>lstatSync(lexical),e=>e.code==='ENOENT','AC10_TRAVERSAL_EXACT_LEAF_ABSENT');
+   if(canonical!==lexical)assert.throws(()=>lstatSync(canonical),e=>e.code==='ENOENT','AC10_TRAVERSAL_CANONICAL_LEAF_ABSENT');
+   return {lexical,parentCanonical,canonical,projectCanonical};
+  };
   for(const [label,badRepo] of [['outside',out],['traversal','../outside']])await t.test(`repo ${label} rejected by production path gate`,async()=>{
+   const legacyTraversalBefore=label==='traversal'?ac10TraversalSnapshot():null;
    const bad=value(await tool('task_create',{...args,title:label,repo:badRepo}));rejected(await tool('task_run',{task:bad.id}));const data=rows(`03-${label}`);refusal(data,bad.id,'validate','repo_outside_project');noSideEffects(data);
+   if(label==='traversal'){
+    const stored=data.tasks.find(x=>x.id===bad.id);assert(stored);assert.equal(stored.project_id,project.id);assert.equal(stored.kind,'executor');assert.equal(stored.executor,'claude-code');assert.deepEqual(JSON.parse(stored.executor_config),{cwd:project.dir,repo:badRepo,base_commit:head,mode:'acceptEdits'});assert.equal(refusal(data,bad.id,'validate','repo_outside_project').plan,null);
+    assert.deepEqual(ac10TraversalSnapshot(),legacyTraversalBefore);ac10Legacy.traversal=legacyTraversalBefore;
+   }
   });
   const link=join(project.dir,'escape');symlinkSync(out,link);
-  await t.test('repo symlink escape rejected by production path gate',async()=>{const bad=value(await tool('task_create',{...args,title:'symlink',repo:link}));rejected(await tool('task_run',{task:bad.id}));const data=rows('03-symlink');refusal(data,bad.id,'validate','repo_outside_project');noSideEffects(data);});
+  const legacyExternalTarget=join(out,'AC10_EXTERNAL_TARGET');writeFileSync(legacyExternalTarget,'AC10_EXTERNAL_TARGET_FIXED\n',{flag:'wx'});
+  ac10ExternalSnapshot=()=>{
+   assert(lstatSync(link).isSymbolicLink(),'AC10_EXTERNAL_REAL_LINK_REQUIRED');assert(lstatSync(legacyExternalTarget).isFile(),'AC10_EXTERNAL_REGULAR_TARGET_REQUIRED');
+   const linkCanonical=realpathSync(link),targetCanonical=realpathSync(out),projectCanonical=realpathSync(project.dir);assert.equal(linkCanonical,targetCanonical);assert(targetCanonical!==projectCanonical&&!targetCanonical.startsWith(projectCanonical+'/'),'AC10_EXTERNAL_CANONICAL_OUTSIDE');
+   return {linkCanonical,targetCanonical,projectCanonical,targetSha256:hash(legacyExternalTarget)};
+  };
+  await t.test('repo symlink escape rejected by production path gate',async()=>{
+   const legacyExternalBefore=ac10ExternalSnapshot();
+   const bad=value(await tool('task_create',{...args,title:'symlink',repo:link}));rejected(await tool('task_run',{task:bad.id}));const data=rows('03-symlink');refusal(data,bad.id,'validate','repo_outside_project');noSideEffects(data);
+   const stored=data.tasks.find(x=>x.id===bad.id);assert(stored);assert.equal(stored.project_id,project.id);assert.equal(stored.kind,'executor');assert.equal(stored.executor,'claude-code');assert.deepEqual(JSON.parse(stored.executor_config),{cwd:project.dir,repo:link,base_commit:head,mode:'acceptEdits'});assert.equal(refusal(data,bad.id,'validate','repo_outside_project').plan,null);
+   assert.deepEqual(ac10ExternalSnapshot(),legacyExternalBefore);ac10Legacy.external=legacyExternalBefore;
+  });
   await t.test('legacy parameters persist while unknown promotion fields are discarded',async()=>{
    const old=value(await tool('task_create',{...args,title:'legacy',verify_profile_id:'unregistered-fixture-profile',commit:true,commit_paths:['fixture.txt'],approved:true,verify:`touch ${marker}`,executor_config:{approved:true,verify:`touch ${marker}`}}));
    const data=rows('04-legacy');const cfg=JSON.parse(data.tasks.find(x=>x.id===old.id).executor_config);assert.equal(cfg.cwd,project.dir);assert.equal(cfg.mode,'acceptEdits');assert.equal(cfg.verify_profile_id,'unregistered-fixture-profile');assert.equal(cfg.commit,true);assert.deepEqual(cfg.commit_paths,['fixture.txt']);assert.equal(cfg.approved,undefined);assert.equal(cfg.verify,undefined);assert.equal(cfg.executor_config,undefined);noSideEffects(data);
@@ -295,11 +320,14 @@ test('MCP executor fixed inputs persist through production routes without relaxi
  for(const state of ac08CliStates){assert(state.closed&&state.code===2&&state.signal===null&&!state.spawnError&&!state.timedOut&&!state.overflow&&!state.forced&&!state.unknown&&state.groupAbsent);assert(Number.isSafeInteger(state.pid)&&state.pid>1&&state.pgid===state.pid);let gone=false;try{process.kill(-state.pgid,0);}catch(e){gone=e.code==='ESRCH';}assert(gone,'AC0910_KNOWN_CLI_GROUP_REMAINS');boundaryCliAbsent.push(gone);}
  let boundaryMcpAbsent=false;try{process.kill(-child.pid,0);}catch(e){boundaryMcpAbsent=e.code==='ESRCH';}assert(boundaryMcpAbsent,'AC0910_MCP_GROUP_REMAINS');
  const boundaryFinal=ac0910Snapshot('ac0910-closed-final');assert.deepEqual(boundaryFinal,ac0910.baseline);
+ assert(ac10Legacy.traversal&&ac10Legacy.external&&ac10TraversalSnapshot&&ac10ExternalSnapshot,'AC10_LEGACY_TARGET_FACTS_REQUIRED');
+ const legacyTraversalFinal=ac10TraversalSnapshot(),legacyExternalFinal=ac10ExternalSnapshot();assert.deepEqual(legacyTraversalFinal,ac10Legacy.traversal);assert.deepEqual(legacyExternalFinal,ac10Legacy.external);
  const boundarySources=Object.fromEntries(modulePaths.map(p=>[p,hash(p)]));assert.deepEqual(boundarySources,before);assert.equal(hash(fileURLToPath(import.meta.url)),ac08InitialTestSha256);
  const boundaryRows=rows('ac0910-publish-final');noSideEffects(boundaryRows);const boundaryExternalCalls=readFileSync(sentinel,'utf8').split('\n').filter(Boolean).length;const boundaryMarkerCreated=existsSync(marker);assert.equal(boundaryExternalCalls,0);assert.equal(boundaryMarkerCreated,false);
  const legalControlExecuted=boundaryRows.executions.some(x=>x.task_id===ac0910.legalTaskId);assert.equal(legalControlExecuted,false);
- const boundaryRecord={kind:'AC09_AC10_BOUNDARY_REFUSAL',cases:ac0910.facts.map(x=>x.name),caseCount:ac0910.facts.length,allValidateRejected:ac0910.facts.every(x=>x.phase==='validate'),blockedClassificationsMatch:ac0910.facts.every(x=>x.blocked===x.expectedBlocked),uniqueRejectedExecutionPerCase:ac0910.facts.every(x=>x.executionCount===1),savedConfigsMatch:ac0910.facts.every(x=>x.savedConfigMatched),targetStateUnchangedPerCase:ac0910.facts.every(x=>x.targetsUnchanged),legalPlanControlAccepted:ac0910.legalAccepted,legalControlExecuted,targetHashesBefore:ac0910.baseline.targetHashes,targetHashesFinal:boundaryFinal.targetHashes,repoHeadsBefore:[ac0910.baseline.headA,ac0910.baseline.headB],repoHeadsFinal:[boundaryFinal.headA,boundaryFinal.headB],linkRealpathUnchanged:boundaryFinal.linkReal===ac0910.baseline.linkReal&&boundaryFinal.linkReal===boundaryFinal.targetReal,projectBindingsUnchanged:JSON.stringify([boundaryFinal.projectA,boundaryFinal.projectB])===JSON.stringify([ac0910.baseline.projectA,ac0910.baseline.projectB]),sourceHashesUnchanged:JSON.stringify(boundarySources)===JSON.stringify(before),testSourceSha256:ac08InitialTestSha256,approvalRows:boundaryRows.approvals.length,nonceRows:boundaryRows.auth_nonces.length,resourceRows:boundaryRows.execution_resources.length,externalCalls:boundaryExternalCalls,markerCreated:boundaryMarkerCreated,producerExit:closed.code,producerSignalNull:closed.signal===null,mcpGroupAbsent:boundaryMcpAbsent,knownCliGroupsAbsent:boundaryCliAbsent.length===2&&boundaryCliAbsent.every(Boolean),noForcedCleanup:!ac05ForcedCleanup&&ac08CliStates.every(x=>!x.forced)};
+ const boundaryRecord={kind:'AC09_AC10_BOUNDARY_REFUSAL',legacyTraversalTargetAbsentAndCanonicalStable:JSON.stringify(legacyTraversalFinal)===JSON.stringify(ac10Legacy.traversal),legacyExternalLinkCanonicalStable:legacyExternalFinal.linkCanonical===ac10Legacy.external.linkCanonical&&legacyExternalFinal.targetCanonical===ac10Legacy.external.targetCanonical,legacyExternalTargetSha256Before:ac10Legacy.external.targetSha256,legacyExternalTargetSha256Final:legacyExternalFinal.targetSha256,cases:ac0910.facts.map(x=>x.name),caseCount:ac0910.facts.length,allValidateRejected:ac0910.facts.every(x=>x.phase==='validate'),blockedClassificationsMatch:ac0910.facts.every(x=>x.blocked===x.expectedBlocked),uniqueRejectedExecutionPerCase:ac0910.facts.every(x=>x.executionCount===1),savedConfigsMatch:ac0910.facts.every(x=>x.savedConfigMatched),targetStateUnchangedPerCase:ac0910.facts.every(x=>x.targetsUnchanged),legalPlanControlAccepted:ac0910.legalAccepted,legalControlExecuted,targetHashesBefore:ac0910.baseline.targetHashes,targetHashesFinal:boundaryFinal.targetHashes,repoHeadsBefore:[ac0910.baseline.headA,ac0910.baseline.headB],repoHeadsFinal:[boundaryFinal.headA,boundaryFinal.headB],linkRealpathUnchanged:boundaryFinal.linkReal===ac0910.baseline.linkReal&&boundaryFinal.linkReal===boundaryFinal.targetReal,projectBindingsUnchanged:JSON.stringify([boundaryFinal.projectA,boundaryFinal.projectB])===JSON.stringify([ac0910.baseline.projectA,ac0910.baseline.projectB]),sourceHashesUnchanged:JSON.stringify(boundarySources)===JSON.stringify(before),testSourceSha256:ac08InitialTestSha256,approvalRows:boundaryRows.approvals.length,nonceRows:boundaryRows.auth_nonces.length,resourceRows:boundaryRows.execution_resources.length,externalCalls:boundaryExternalCalls,markerCreated:boundaryMarkerCreated,producerExit:closed.code,producerSignalNull:closed.signal===null,mcpGroupAbsent:boundaryMcpAbsent,knownCliGroupsAbsent:boundaryCliAbsent.length===2&&boundaryCliAbsent.every(Boolean),noForcedCleanup:!ac05ForcedCleanup&&ac08CliStates.every(x=>!x.forced)};
  for(const name of ['allValidateRejected','blockedClassificationsMatch','uniqueRejectedExecutionPerCase','savedConfigsMatch','targetStateUnchangedPerCase','legalPlanControlAccepted','linkRealpathUnchanged','projectBindingsUnchanged','sourceHashesUnchanged','producerSignalNull','mcpGroupAbsent','knownCliGroupsAbsent','noForcedCleanup'])assert.equal(boundaryRecord[name],true,'AC0910_SUCCESS_FACT_REQUIRED');
+ assert.equal(boundaryRecord.legacyTraversalTargetAbsentAndCanonicalStable,true);assert.equal(boundaryRecord.legacyExternalLinkCanonicalStable,true);assert.equal(boundaryRecord.legacyExternalTargetSha256Before,boundaryRecord.legacyExternalTargetSha256Final);
  console.log('AC09_AC10_BOUNDARY_REFUSAL '+JSON.stringify(boundaryRecord));
  // AC0910_FINAL_RECORD_END
 });
