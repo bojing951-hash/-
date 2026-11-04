@@ -1,5 +1,6 @@
 name: ci
 on:
+  workflow_dispatch:
   push:
     branches: ['fix/**', 'dev/**']
   pull_request:
