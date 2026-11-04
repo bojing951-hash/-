@@ -57,7 +57,7 @@ function loadKey() {
 
 const API_KEY = loadKey();
 if (!API_KEY) {
-  console.error(`[fatal] 无法读取模型密钥文件: ${KEY_FILE}`);
+  console.error(JSON.stringify({ kind: 'EGRESS_PROXY_EVENT', class: 'KEY_UNAVAILABLE' }));
   process.exit(1);
 }
 
@@ -68,7 +68,7 @@ function hostAllowed(hostport) {
 
 const server = createServer((req, res) => {
   if (!req.url.startsWith(MODEL_PREFIX)) {
-    console.error(`[deny-http] ${req.method} ${req.url}`);
+    console.error(JSON.stringify({ kind: 'EGRESS_PROXY_EVENT', class: 'HTTP_PATH_DENIED' }));
     res.writeHead(403, { 'content-type': 'text/plain' });
     res.end('forbidden path\n');
     return;
@@ -81,7 +81,7 @@ const server = createServer((req, res) => {
   const token = m ? m[1] : headerTok;
   const tokens = loadTokens();
   if (!token || !tokens[token]) {
-    console.error(`[model-deny] ${req.method} ${req.url} token=${token ? token.slice(0, 6) + '…' : 'none'}`);
+    console.error(JSON.stringify({ kind: 'EGRESS_PROXY_EVENT', class: 'MODEL_AUTH_DENIED' }));
     res.writeHead(401, { 'content-type': 'text/plain' });
     res.end('model authorization required\n');
     return;
@@ -101,21 +101,21 @@ const server = createServer((req, res) => {
     }
   );
   upstream.on('error', (e) => {
-    console.error(`[upstream-error] ${e.message}`);
+    console.error(JSON.stringify({ kind: 'EGRESS_PROXY_EVENT', class: 'UPSTREAM_ERROR' }));
     if (!res.headersSent) {
       res.writeHead(502, { 'content-type': 'text/plain' });
       res.end('upstream error\n');
     }
   });
   req.pipe(upstream);
-  console.error(`[model] exec=${tokens[token].execution_id} ${req.method} ${upstreamPath}`);
+  console.error(JSON.stringify({ kind: 'EGRESS_PROXY_EVENT', class: 'MODEL_FORWARD' }));
 });
 
 server.on('connect', (req, clientSocket, head) => {
   const target = req.url;
   if (!hostAllowed(target)) {
     clientSocket.end('HTTP/1.1 403 Forbidden\r\n\r\n');
-    console.error(`[deny] ${target}`);
+    console.error(JSON.stringify({ kind: 'EGRESS_PROXY_EVENT', class: 'CONNECT_DENIED' }));
     return;
   }
   const [host, port = 443] = target.split(':');
@@ -124,12 +124,12 @@ server.on('connect', (req, clientSocket, head) => {
     upstream.write(head);
     upstream.pipe(clientSocket);
     clientSocket.pipe(upstream);
-    console.error(`[allow] ${target}`);
+    console.error(JSON.stringify({ kind: 'EGRESS_PROXY_EVENT', class: 'CONNECT_ALLOWED' }));
   });
   upstream.on('error', () => clientSocket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n'));
   clientSocket.on('error', () => upstream.destroy());
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.error(`egress proxy on :${PORT}, allow=${ALLOW.join(',')}, model=${MODEL_PREFIX} -> ${UPSTREAM_HOST}`);
+  console.error(JSON.stringify({ kind: 'EGRESS_PROXY_EVENT', class: 'LISTENING' }));
 });
