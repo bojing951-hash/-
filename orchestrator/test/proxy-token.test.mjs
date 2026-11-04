@@ -77,23 +77,102 @@ async function startProxy(tokens) {
     },
     stdio: ['ignore', 'pipe', 'pipe']
   });
-  let stderr = '';
+  let closed = false;
+  let stopPromise;
+  let pending = '';
+  let readySettled = false;
+  let readyTimer;
+  let resolveReady;
+  let rejectReady;
+  let resolveClosed;
+  const closedPromise = new Promise((resolve) => { resolveClosed = resolve; });
   const ready = new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`proxy start timeout: ${stderr}`)), 8000);
-    child.stderr.on('data', (d) => {
-      stderr += d.toString();
-      if (stderr.includes('egress proxy on')) {
-        clearTimeout(timer);
-        resolve();
-      }
-    });
-    child.on('exit', (code) => {
-      clearTimeout(timer);
-      reject(new Error(`proxy exited ${code}: ${stderr}`));
-    });
+    resolveReady = resolve;
+    rejectReady = reject;
   });
-  await ready;
-  return { port, child, stop: () => child.kill('SIGKILL') };
+  const finishReady = (error) => {
+    if (readySettled) return;
+    readySettled = true;
+    clearTimeout(readyTimer);
+    pending = '';
+    child.stderr.off('data', onData);
+    child.stderr.resume();
+    if (error) rejectReady(error);
+    else resolveReady();
+  };
+  const onError = () => finishReady(new Error('PROXY_CHILD_ERROR'));
+  const onPipeError = () => finishReady(new Error('PROXY_PIPE_ERROR'));
+  const onClose = () => {
+    closed = true;
+    finishReady(new Error('PROXY_CLOSED_BEFORE_READY'));
+    child.off('error', onError);
+    child.off('close', onClose);
+    child.stdout.off('error', onPipeError);
+    child.stderr.off('error', onPipeError);
+    resolveClosed();
+  };
+  const onData = (chunk) => {
+    for (const part of chunk.split(/(?<=\n)/)) {
+      if (pending.length + part.length > 8192) {
+        finishReady(new Error('PROXY_READY_BUFFER_LIMIT'));
+        return;
+      }
+      pending += part;
+      if (!pending.endsWith('\n')) continue;
+      const line = pending;
+      pending = '';
+      let event;
+      try { event = JSON.parse(line); } catch { continue; }
+      if (event && !Array.isArray(event) && typeof event === 'object' &&
+          Object.keys(event).sort().join(',') === 'class,kind' &&
+          event.kind === 'EGRESS_PROXY_EVENT' && event.class === 'LISTENING') {
+        finishReady();
+        return;
+      }
+    }
+  };
+  child.on('error', onError);
+  child.on('close', onClose);
+  child.stdout.on('error', onPipeError);
+  child.stderr.on('error', onPipeError);
+  child.stdout.resume();
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', onData);
+  readyTimer = setTimeout(() => finishReady(new Error('PROXY_START_TIMEOUT')), 8000);
+  const waitClosed = async (milliseconds) => {
+    if (closed) return true;
+    let timer;
+    try {
+      return await Promise.race([
+        closedPromise.then(() => true),
+        new Promise((resolve) => { timer = setTimeout(() => resolve(false), milliseconds); }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  const stop = () => {
+    if (!stopPromise) stopPromise = (async () => {
+      clearTimeout(readyTimer);
+      child.stderr.off('data', onData);
+      pending = '';
+      child.stdout.resume();
+      child.stderr.resume();
+      if (closed) return;
+      try { child.kill('SIGTERM'); } catch { /* Actual close is still required. */ }
+      if (await waitClosed(1000)) return;
+      try { child.kill('SIGKILL'); } catch { /* Never infer exit from a signal. */ }
+      if (!await waitClosed(1000)) throw new Error('PROXY_CLEANUP_UNCONFIRMED');
+    })();
+    return stopPromise;
+  };
+  try {
+    await ready;
+    return { port, child, stop };
+  } catch (error) {
+    await stop();
+    throw error;
+  }
 }
 
 test('模型代理：无令牌/过期/已撤销 401，有效令牌才进入上游', async () => {
@@ -119,6 +198,6 @@ test('模型代理：无令牌/过期/已撤销 401，有效令牌才进入上�
     const validRes = await fetch(`${base}/s/${validA}/v1/messages`, { signal: AbortSignal.timeout(5000) });
     assert.equal(validRes.status, 502, '有效令牌必须通过 401 检查');
   } finally {
-    proxy.stop();
+    await proxy.stop();
   }
 });
