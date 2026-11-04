@@ -424,3 +424,71 @@ test('AC-14 缺少可信校验不得产生 Commit', async () => {
   assert.equal(headOf(repo), before, '缺少校验不得产生新 commit');
   assert.equal(svc.getTask(t.id).status, 'failed');
 });
+
+
+test('VERIFY-TIMEOUT: trusted profile milliseconds reach verification and preserve failure boundaries', async () => {
+  const profileTimeoutMs = [1379, 0];
+  const observations = [];
+  for (const timeoutMs of profileTimeoutMs) {
+    const { p, head } = projectWithRepo(`verify-timeout-${timeoutMs}`);
+    const repo = join(p.dir, 'repo');
+    const program = process.execPath;
+    const argv = ['--version'];
+    const vp = seedVerifyProfile(p, { program, argv });
+    svc.db().prepare('UPDATE verify_profiles SET timeout_ms=?, cwd=? WHERE id=?').run(timeoutMs, p.dir, vp);
+    const task = svc.createTask({
+      project: p.id,
+      title: 'Verification timeout forwarding component',
+      input: 'write feature.txt',
+      kind: 'executor',
+      executor: 'claude-code',
+      executorConfig: {
+        mode: 'plan', repo: 'repo', base_commit: head, commit: false,
+        commit_paths: ['feature.txt'], verify_profile_id: vp, timeout_ms: 9876
+      }
+    });
+    const claudeWorkdirs = [];
+    const verifyOptions = [];
+    const isolation = {
+      ...fakeIsolation,
+      runClaudeIsolated: async (options) => {
+        claudeWorkdirs.push(options.workdir);
+        return fakeIsolation.runClaudeIsolated(options);
+      },
+      runInWorkdir: async (options) => {
+        verifyOptions.push(options);
+        return { ok: false, exitCode: 17, output: 'VERIFY_TIMEOUT_COMPONENT' };
+      }
+    };
+    const r = await svc.runTask(task.id, { isolation });
+    const captured = verifyOptions[0];
+    observations.push({
+      actualTimeoutMs: captured?.timeoutMs === undefined ? null : captured.timeoutMs,
+      verifyCalls: verifyOptions.length,
+      verifyExitCode: r.verify?.exitCode ?? null,
+      programArgvMatch: verifyOptions.length === 1 && captured.program === program && JSON.stringify(captured.args) === JSON.stringify(argv),
+      workdirBound: claudeWorkdirs.length === 1 && verifyOptions.length === 1 && captured.workdir === claudeWorkdirs[0] && captured.workdir === join(process.env.JARVIS_HOME, 'worktrees', task.id) && captured.workdir !== p.dir,
+      taskFailed: r.ok === false && r.task?.status === 'failed' && svc.getTask(task.id).status === 'failed',
+      repoHeadUnchanged: headOf(repo) === head
+    });
+  }
+  const record = {
+    kind: 'VERIFY_TIMEOUT_COMPONENT',
+    actualTimeoutMs: observations.map(o => o.actualTimeoutMs),
+    profileTimeoutMs,
+    taskTimeoutMs: 9876,
+    verifyExitCodes: observations.map(o => o.verifyExitCode),
+    verifyCalls: observations.reduce((n, o) => n + o.verifyCalls, 0),
+    programArgvMatch: observations.every(o => o.programArgvMatch),
+    workdirBound: observations.every(o => o.workdirBound),
+    tasksFailed: observations.every(o => o.taskFailed),
+    repoHeadsUnchanged: observations.every(o => o.repoHeadUnchanged)
+  };
+  console.log('VERIFY_TIMEOUT_COMPONENT ' + JSON.stringify(record));
+  assert.equal(record.verifyCalls, 2, 'VERIFY_TIMEOUT_CALL_COUNT');
+  assert.deepEqual(record.verifyExitCodes, [17, 17], 'VERIFY_TIMEOUT_EXIT_PROPAGATION');
+  for (const key of ['programArgvMatch', 'workdirBound', 'tasksFailed', 'repoHeadsUnchanged']) {
+    assert.equal(record[key], true, 'VERIFY_TIMEOUT_BOUNDARY_INVARIANT');
+  }
+  assert.deepEqual(record.actualTimeoutMs, [1379, 300_000], 'VERIFY_TIMEOUT_PROFILE_FORWARDING');
+});

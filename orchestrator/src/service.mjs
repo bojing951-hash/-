@@ -976,6 +976,8 @@ async function runExecutorTask(task, project, deps = {}) {
     if (res.ok && resolved.profile) {
       db().prepare("UPDATE tasks SET status='verifying', updated_at=? WHERE id=? AND status='running'").run(now(), task.id);
       const verifyName = `jarvis-verify-${execId}`;
+      const profileTimeoutMs = resolved.profile.timeout_ms;
+      const verifyTimeoutMs = Number.isSafeInteger(profileTimeoutMs) && profileTimeoutMs > 0 ? profileTimeoutMs : 300_000;
       const vr = await launchContainer({
         executionId: execId,
         taskId: task.id,
@@ -986,6 +988,7 @@ async function runExecutorTask(task, project, deps = {}) {
           workdir: dest,
           program: resolved.profile.program,
           args: JSON.parse(resolved.profile.argv || '[]'),
+          timeoutMs: verifyTimeoutMs,
           image: st.image,
           guard: () => claimDockerInvocation(resourceId, task.id),
         onStarted: () => markContainerRunning(resourceId)
