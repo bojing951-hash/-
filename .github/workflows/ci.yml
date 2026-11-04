@@ -188,7 +188,7 @@ jobs:
             requireFact(cancelled.length === 1, 'missing cancellation payload');
             const result = JSON.parse(cancelled[0].payload).results.find(value => value.execution === ex.id);
             requireFact(result?.confirmedExit === true && result.containers.some(value => value.name === name && value.confirmed === true && value.escalated === true && value.killAccepted === true && value.containerState === 'exited'), 'incomplete real cancellation metadata');
-            records.push({ originalSpecialChecks: 6, nodeTestCountUnaffected: 334, physicalCancellationBeforeCleanup: true });
+            records.push({ originalSpecialChecks: 6, nodeTestCountReportedSeparately: true, physicalCancellationBeforeCleanup: true });
           } catch (error) { errors.push(error.stack); }
 
           // No cleanup may turn a failed cancellation into success; never operate on a name/prefix.
